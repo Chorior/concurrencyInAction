@@ -39,5 +39,5 @@
     t.join();
   }
   ```
-* 管理线程的函数和类在<thread>中声明，保护共享数据的函数和类在其他头文件中声明;
+* 管理线程的函数和类在`<thread>`中声明，保护共享数据的函数和类在其他头文件中声明;
 * If software is to take advantage of this increased computing power, it must be designed to run multiple tasks concurrently.
