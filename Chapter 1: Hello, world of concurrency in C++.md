@@ -27,7 +27,8 @@
       * 任务并行: 将一个单个任务分成几部分;
       * 数据并行: 一个线程执行算法的一部分，而另一个线程执行算法的另一个部分;或者每个线程在不同的数据部分上执行操作;
 * 不使用并发的唯一原因: the benefit is not worth the cost;
-* 简单的并发程序
+* 简单的并发程序,**编译时加上`-pthread`**
+
   ```C++
   #include <iostream>
   #include <thread>
