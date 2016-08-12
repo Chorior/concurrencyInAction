@@ -362,7 +362,7 @@ thread; it isn’t associated with any thread.
        threads.push_back(std::thread(do_work,i));
      }
      std::for_each(threads.begin(),threads.end(),
-     std::mem_fn(&std::thread::join));
+                    std::mem_fn(&std::thread::join)); // Call join() on each thread in turn
   }
   ```
 
