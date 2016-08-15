@@ -17,7 +17,7 @@
 * However, it isn’t recommended practice to call the member functions directly, because this means that you have to remember to call unlock() on every code path out of a function, including those due to exceptions;
   * 不建议直接调用成员函数,因为那样你必须记得在每个函数出口(包括异常)处调用`unlock()`;
 * Instead, the Standard C++ Library provides the std::lock_guard class template, which implements that RAII idiom for a mutex; it locks the supplied mutex on construction and unlocks it on destruction, thus ensuring a locked mutex is always correctly unlocked;
-  * C++标准库提供了实现了RAII的`std::lock_guard`类模板,它爱构造时锁住互斥量,析构时释放互斥量;
+  * C++标准库提供了实现了RAII的`std::lock_guard`类模板,它在构造时锁住互斥量,析构时释放互斥量;
   * RAII(Resource Acquisition Is Initialization): 资源获取就是初始化,是C++语言的一种管理资源、避免泄漏的惯用法,C++标准保证任何情况下,已构造的对象最终会销毁,即它的析构函数最终会被调用;
 * `std::mutex`和`std::lock_guard`都在头文件`<mutex>`中定义;
 
