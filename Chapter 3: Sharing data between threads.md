@@ -300,27 +300,27 @@
 * the `std::unique_lock` objects could be passed to `std::lock()` because `std::unique_lock` provides lock(), try_lock(), and unlock() member functions;
   * `std::unique_lock`实例能被传递给`std::lock()`是因为`std::unique_lock`提供lock(), try_lock(), and unlock()成员函数;
 * These forward to the member functions of the same name on the underlying mutex to do the actual work and just update a flag inside the `std::unique_lock` instance to indicate whether the mutex is currently owned by that instance. This flag is necessary in order to ensure that unlock() is called correctly in the destructor. If the instance does own the mutex, the destructor must call unlock(), and if the instance does not own the mutex, it must not call unlock(). This flag can be queried by calling the owns_lock() member function;
-  * 这些同名的成员函数在低层做着实际的工作，并且仅更新`std::unique_lock`实例中的标志，来确定该实例是否拥有特定的互斥量;这个标志是为了确保unlock()在析构函数中被正确调用;如果实例拥有互斥量，那么析构函数必须调用unlock();但当实例中没有互斥量时,析构函数就不能去调用unlock();这个标志可以通过owns_lock()成员变量进行查询;
+  * 这些同名的成员函数在低层做着实际的工作，并且仅更新`std::unique_lock`实例中的标志，来确定该实例是否拥有特定的互斥量;这个标志是为了确保unlock()在析构函数中被正确调用;如果实例拥有互斥量，那么析构函数必须调用unlock();但当实例中没有互斥量时,析构函数就不能去调用unlock();这个标志可以通过owns_lock()成员函数进行查询;
 
-```C++
-class some_big_object;
-void swap(some_big_object& lhs,some_big_object& rhs);
-class X
-{
-private:
-   some_big_object some_detail;
-   std::mutex m;
-public:
-   X(some_big_object const& sd):some_detail(sd){}
-   friend void swap(X& lhs, X& rhs)
-   {
-     if(&lhs==&rhs)
-     return;
-     std::unique_lock<std::mutex> lock_a(lhs.m,std::defer_lock);
-     std::unique_lock<std::mutex> lock_b(rhs.m,std::defer_lock);
-     std::lock(lock_a,lock_b);
-     swap(lhs.some_detail,rhs.some_detail);
-   }
-};
-```
+  ```C++
+  class some_big_object;
+  void swap(some_big_object& lhs,some_big_object& rhs);
+  class X
+  {
+  private:
+     some_big_object some_detail;
+     std::mutex m;
+  public:
+     X(some_big_object const& sd):some_detail(sd){}
+     friend void swap(X& lhs, X& rhs)
+     {
+       if(&lhs==&rhs)
+       return;
+       std::unique_lock<std::mutex> lock_a(lhs.m,std::defer_lock);
+       std::unique_lock<std::mutex> lock_b(rhs.m,std::defer_lock);
+       std::lock(lock_a,lock_b);
+       swap(lhs.some_detail,rhs.some_detail);
+     }
+  };
+  ```
 * 3.2.7
