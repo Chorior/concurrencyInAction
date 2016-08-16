@@ -323,4 +323,256 @@
      }
   };
   ```
-* 3.2.7
+
+* Because `std::unique_lock` instances don’t have to own their associated mutexes, the ownership of a mutex can be transferred between instances by moving the instances around;
+  * 由于`std::unique_lock`实例不需要持有它们相关的互斥量,所以可以通过移动实例来传递互斥量所有权;
+* Fundamentally this depends on whether the source is an lvalue—a real variable or reference to one—or an rvalue—a temporary of some kind. Ownership transfer is automatic if the source is an rvalue and must be done explicitly for an lvalue in order to avoid accidentally transferring ownership away from a variable;
+  * 如果源值是一个右值,那么所有权传递是自动的;
+  * 如果源值是一个左值,那么必须明确调用`std::move()`传递所有权,为了避免所有权转移出错;
+* `std::unique_lock` is an example of a type that’s movable but not copyable;
+  * `std::unique_lock`是可移动但不可复制类型;
+
+  ```C++
+  /// unique_lock
+  template<typename _Mutex>
+  class unique_lock
+  {
+  public:
+    typedef _Mutex mutex_type;
+
+    unique_lock() noexcept
+    : _M_device(0), _M_owns(false)
+    { }
+
+    explicit unique_lock(mutex_type& __m)
+    : _M_device(std::__addressof(__m)), _M_owns(false)
+    {
+      lock();
+      _M_owns = true;
+    }
+
+    unique_lock(mutex_type& __m, defer_lock_t) noexcept
+    : _M_device(std::__addressof(__m)), _M_owns(false)
+    { }
+
+    unique_lock(mutex_type& __m, try_to_lock_t)
+    : _M_device(std::__addressof(__m)), _M_owns(_M_device->try_lock())
+    { }
+
+    unique_lock(mutex_type& __m, adopt_lock_t)
+    : _M_device(std::__addressof(__m)), _M_owns(true)
+    {
+        // XXX calling thread owns mutex
+    }
+
+    template<typename _Clock, typename _Duration>
+  unique_lock(mutex_type& __m,
+      const chrono::time_point<_Clock, _Duration>& __atime)
+  : _M_device(std::__addressof(__m)),
+  _M_owns(_M_device->try_lock_until(__atime))
+  { }
+
+    template<typename _Rep, typename _Period>
+  unique_lock(mutex_type& __m,
+      const chrono::duration<_Rep, _Period>& __rtime)
+  : _M_device(std::__addressof(__m)),
+  _M_owns(_M_device->try_lock_for(__rtime))
+  { }
+
+    ~unique_lock()
+    {
+      if (_M_owns)
+      unlock();
+    }
+
+    unique_lock(const unique_lock&) = delete;
+    unique_lock& operator=(const unique_lock&) = delete;
+
+    unique_lock(unique_lock&& __u) noexcept
+    : _M_device(__u._M_device), _M_owns(__u._M_owns)
+    {
+      __u._M_device = 0;
+      __u._M_owns = false;
+    }
+
+    unique_lock& operator=(unique_lock&& __u) noexcept
+    {
+      if(_M_owns)
+        unlock();
+
+      unique_lock(std::move(__u)).swap(*this);
+
+      __u._M_device = 0;
+      __u._M_owns = false;
+
+      return *this;
+    }
+
+    void
+    lock()
+    {
+      if (!_M_device)
+        __throw_system_error(int(errc::operation_not_permitted));
+      else if (_M_owns)
+        __throw_system_error(int(errc::resource_deadlock_would_occur));
+      else
+      {
+        _M_device->lock();
+        _M_owns = true;
+      }
+    }
+
+    bool
+    try_lock()
+    {
+      if (!_M_device)
+        __throw_system_error(int(errc::operation_not_permitted));
+      else if (_M_owns)
+        __throw_system_error(int(errc::resource_deadlock_would_occur));
+      else
+      {
+        _M_owns = _M_device->try_lock();
+        return _M_owns;
+      }
+    }
+
+    template<typename _Clock, typename _Duration>
+  bool
+  try_lock_until(const chrono::time_point<_Clock, _Duration>& __atime)
+  {
+    if (!_M_device)
+      __throw_system_error(int(errc::operation_not_permitted));
+    else if (_M_owns)
+      __throw_system_error(int(errc::resource_deadlock_would_occur));
+    else
+    {
+      _M_owns = _M_device->try_lock_until(__atime);
+      return _M_owns;
+    }
+  }
+
+    template<typename _Rep, typename _Period>
+  bool
+  try_lock_for(const chrono::duration<_Rep, _Period>& __rtime)
+  {
+    if (!_M_device)
+      __throw_system_error(int(errc::operation_not_permitted));
+    else if (_M_owns)
+      __throw_system_error(int(errc::resource_deadlock_would_occur));
+    else
+    {
+      _M_owns = _M_device->try_lock_for(__rtime);
+      return _M_owns;
+    }
+  }
+
+    void
+    unlock()
+    {
+      if (!_M_owns)
+        __throw_system_error(int(errc::operation_not_permitted));
+      else if (_M_device)
+      {
+        _M_device->unlock();
+        _M_owns = false;
+      }
+    }
+
+    void
+    swap(unique_lock& __u) noexcept
+    {
+      std::swap(_M_device, __u._M_device);
+      std::swap(_M_owns, __u._M_owns);
+    }
+
+    mutex_type*
+    release() noexcept
+    {
+      mutex_type* __ret = _M_device;
+      _M_device = 0;
+      _M_owns = false;
+      return __ret;
+    }
+
+    bool
+    owns_lock() const noexcept
+    { return _M_owns; }
+
+    explicit operator bool() const noexcept
+    { return owns_lock(); }
+
+    mutex_type*
+    mutex() const noexcept
+    { return _M_device; }
+
+  private:
+    mutex_type*	_M_device;
+    bool		_M_owns; // XXX use atomic_bool
+  };
+  ```
+
+  ```C++
+  std::unique_lock<std::mutex> get_lock()
+  {
+     extern std::mutex some_mutex;
+     std::unique_lock<std::mutex> lk(some_mutex);
+     prepare_data();
+     return lk;
+  }
+  void process_data()
+  {
+     std::unique_lock<std::mutex> lk(get_lock());
+     do_something();
+  }
+  ```
+
+  * One such usage is where the lock isn’t returned directly but is a data member of a gateway class used to ensure correctly locked access to some protected data. In this case, all access to the data is through this gateway class: when you wish to access the data, you obtain an instance of the gateway class (by calling a function such as get_lock() in the preceding example), which acquires the lock. You can then access the data through member functions of the gateway object. When you’re finished, you destroy the gateway object, which releases the lock and allows other threads to access the protected data;
+    * 当函数不直接返回锁而是一个gateway calss用来确认一些保护数据是否被正确锁住的数据成员时,所有访问这些数据的操作都要经过这个gateway class,当你想访问这些数据时,你需要获得一个该gateway class的实例(就像上面调用get_lock()函数一样)来获取锁,然后通过gateway class的成员函数来访问这些数据;当你结束时,销毁这个gateway calss实例来释放锁,继而允许其它线程访问这些数据;
+  * The flexibility of `std::unique_lock` also allows instances to relinquish their locks before they’re destroyed. You can do this with the unlock() member function, just like for a mutex: std::unique_lock supports the same basic set of member functions for locking and unlocking as a mutex does, in order that it can be used with generic functions such as `std::lock`;
+    * `std::unique_lock`允许在销毁实例前释放锁,通过调用成员函数`unlock()`实现;
+* Locking at an appropriate granularity
+  * 以一个合适的粒度上锁;
+
+  ```C++
+  void get_and_process_data()
+  {
+     std::unique_lock<std::mutex> my_lock(the_mutex);
+     some_class data_to_process=get_next_data_chunk();
+     my_lock.unlock();
+     result_type result=process(data_to_process);
+     my_lock.lock();
+     write_result(data_to_process,result);
+  }
+  ```
+
+* the lock granularity is a hand-waving term to describe the amount of data protected by a single lock;
+  * 锁的粒度指的是描述一个锁保护的数据的总量的hand-waving术语;
+* In general, a lock should be held for only the minimum possible time needed to perform the required operations;
+  * 通常,一个锁只需要持续能够完成需要的操作的最小可能时间即可;
+* if you don’t hold the required locks for the entire duration of an operation, you’re exposing yourself to race conditions;
+  * 如果在所需操作的整个持续时间内,你诶有持有所需要的锁,那么你会进入竞争状态;
+  * 下面程序在获取lhs_value and rhs_value时,可能数据发生了改变
+
+```C++
+class Y
+{
+private:
+   int some_detail;
+   mutable std::mutex m;
+   int get_detail() const
+   {
+     std::lock_guard<std::mutex> lock_a(m);
+     return some_detail;
+   }
+public:
+   Y(int sd):some_detail(sd){}
+   friend bool operator==(Y const& lhs, Y const& rhs)
+   {
+     if(&lhs==&rhs)
+     return true;
+     int const lhs_value=lhs.get_detail();
+     int const rhs_value=rhs.get_detail();
+     return lhs_value==rhs_value;
+   }
+};
+```
