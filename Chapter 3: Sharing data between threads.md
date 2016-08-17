@@ -576,3 +576,28 @@ public:
    }
 };
 ```
+
+* the C++ Standard provides a mechanism purely for protecting shared data during initialization;
+  * C++标准提供了一种纯粹在初始化过程中保护共享数据的机制;
+* infamous Double-Checked Locking pattern: the pointer is first read without acquiring the lock, and the lock is acquired only if the pointer is NULL. The pointer is then checked again once the lock has been acquired c (hence the doublechecked part) in case another thread has done the initialization between the first check and this thread acquiring the lock;
+  * 声名狼藉的双重检查锁: 第一次读读指针时不上锁,只当这个指针为空时,上锁;然后再次检查锁,看其它线程是否在第一次检查和获取锁期间对该指针做了初始化;
+  * 代码如下
+
+  ```C++
+  void undefined_behaviour_with_double_checked_locking()
+  {
+     if(!resource_ptr)
+     {
+       std::lock_guard<std::mutex> lk(resource_mutex);
+       if(!resource_ptr)
+       {
+         resource_ptr.reset(new some_resource);
+       }
+     }
+     resource_ptr->do_something();
+  }
+  ```
+
+  * Unfortunately, this pattern is infamous for a reason: it has the potential for nasty race conditions, because the read outside the lock isn’t synchronized with the write done by another thread inside the lock. This therefore creates a race condition that covers not just the pointer itself but also the object pointed to; even if a thread sees the pointer written by another thread, it might not see the newly created instance of some_resource, resulting in the call to do_something() operating on incorrect values;
+    * 这样的问题是: 因为第一次读的时候没有与另一个线程的写同步,这样在指针不为空的时候,指针在程序执行期间可能会发生改变,即数据竞争;即使第一次验证为空,第二次检验发现有另一个线程对指针做了初始化,但新创建的实例可能不可见,那么调用do_something()的结果就会产生不正确的结果;
+  
