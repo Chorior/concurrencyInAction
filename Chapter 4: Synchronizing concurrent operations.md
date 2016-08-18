@@ -7,6 +7,7 @@
     * 消耗不必要的时间检查;
     * 上锁时,其它需要该锁的线程会处于等待状态,消耗系统资源;
   * 在等待完成期间,使用`std::this_thread::sleep_for()`函数进行周期时间间歇;
+    * 难以确定合适的休息时间;
 
   ```C++
   bool flag;
@@ -22,7 +23,7 @@
      }
   }
   ```
-    * 难以确定合适的休息时间;
+  
   * 使用Ｃ++标准库工具等待时间本身(最好的选择)
     * The most basic mechanism for waiting for an event to be triggered by another thread is the condition variable;
       * 等待事件被另一个线程触发最基本的措施是使用条件变量;
