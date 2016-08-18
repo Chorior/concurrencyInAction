@@ -600,4 +600,110 @@ public:
 
   * Unfortunately, this pattern is infamous for a reason: it has the potential for nasty race conditions, because the read outside the lock isn’t synchronized with the write done by another thread inside the lock. This therefore creates a race condition that covers not just the pointer itself but also the object pointed to; even if a thread sees the pointer written by another thread, it might not see the newly created instance of some_resource, resulting in the call to do_something() operating on incorrect values;
     * 这样的问题是: 因为第一次读的时候没有与另一个线程的写同步,这样在指针不为空的时候,指针在程序执行期间可能会发生改变,即数据竞争;即使第一次验证为空,第二次检验发现有另一个线程对指针做了初始化,但新创建的实例可能不可见,那么调用do_something()的结果就会产生不正确的结果;
-  
+* Rather than locking a mutex and explicitly checking the pointer, every thread can just use `std::call_once`, safe in the knowledge that the pointer will have been initialized by some thread (in a properly synchronized fashion) by the time `std::call_once` returns;
+  * 比起锁住互斥量并显式的检查指针,每个线程可以只使用`std::call_once`,当其返回时就能知道指针已经在其它线程初始化了;
+* Use of `std::call_once` will typically have a lower overhead than using a mutex explicitly, especially when the initialization has already been done, so should be used in preference where it matches the required functionality;
+  * 使用`std::call_once`比显式使用互斥量更省资源,尤其是在初始化已经完成之后,这个结论同样适合于引用;
+
+  ```C++
+  std::shared_ptr<some_resource> resource_ptr;
+  std::once_flag resource_flag;
+  void init_resource()
+  {
+    resource_ptr.reset(new some_resource);
+  }
+  void foo()
+  {
+     std::call_once(resource_flag,init_resource); // Initialization is called exactly once
+     resource_ptr->do_something();
+  }
+  ```
+  ```C++
+  class X
+  {
+  private:
+     connection_info connection_details;
+     connection_handle connection;
+     std::once_flag connection_init_flag;
+     void open_connection()
+     {
+       connection=connection_manager.open(connection_details);
+     }
+  public:
+      X(connection_info const& connection_details_):
+     connection_details(connection_details_)
+     {}
+     void send_data(data_packet const& data)
+     {
+       std::call_once(connection_init_flag,&X::open_connection,this);
+       connection.send_data(data);
+     }
+     data_packet receive_data()
+     {
+       std::call_once(connection_init_flag,&X::open_connection,this);
+       return connection.receive_data();
+     }
+  };
+  ```
+
+  *  It’s worth noting that, like `std::mutex`, `std::once_flag` instances can’t be copied or moved, so if you use them as a class member like this, you’ll have to explicitly define these special member functions should you require them;
+    * `std::mutex`和`std::once_flag`实例不能复制或者移动,如果把它们当作类成员来使用,你需要明确定义成员函数你要使用它们;
+* This can be used as an alternative to `std::call_once` for those cases where a single global instance is required:
+  * 当只要一个全局实例时,`std::call_once`的替代方案为:
+
+  ```C++
+  class my_class;
+  my_class& get_my_class_instance()
+  {
+    static my_class instance;
+    return instance;
+  }
+  ```
+
+  * Multiple threads can then call `get_my_class_instance()` safely, without having to worry about race conditions on the initialization;
+    * 多线程可以安全的调用`get_my_class_instance()`函数,而不用担心初始化过程中的条件竞争;
+* Protecting data only for initialization is a special case of a more general scenario: that of a rarely updated data structure. For most of the time, such a data structure is read-only and can therefore be merrily read by multiple threads concurrently, but on occasion the data structure may need updating. What’s needed here is a protection mechanism that acknowledges this fact;
+  * 初始化数据保护是下列情况的一个特例:
+    * 对于很少有更新的数据结构,大多数情况下是只读的,所以并发不会有问题;但是一旦数据发生更新,就可能造成条件竞争;
+* 保护很少进行更新的数据结构
+  * 使用`boost::shared_mutex`代替使用`std::mutex`;
+  * 当数据进行更新操作时,可以使用`std::lock_guard<boost::shared_mutex>`和`std::unique_lock<boost::shared_mutex>`进行锁定,这能保证单独访问;
+  * 不更新数据结构时,可以使用`boost::shared_lock<boost::shared_mutex>`去访问共享数据;
+  * The only constraint is that if any thread has a shared lock, a thread that tries to acquire an exclusive lock will block until all other threads have relinquished their locks, and likewise if any thread has an exclusive lock, no other thread may acquire a shared or exclusive lock until the first thread has relinquished its lock;
+    * 这样做的唯一限制是
+      * 当一个线程尝试获取独占锁时,它需要等待其它拥有共享锁的线程解锁;
+      * 当一个线程拥有独占锁时,其它线程不能获取独占锁或共享锁;
+
+  ```C++
+  #include <map>
+  #include <string>
+  #include <mutex>
+  #include <boost/thread/shared_mutex.hpp>
+  class dns_entry;
+  class dns_cache
+  {
+     std::map<std::string,dns_entry> entries;
+     mutable boost::shared_mutex entry_mutex;
+  public:
+     dns_entry find_entry(std::string const& domain) const
+     {
+       boost::shared_lock<boost::shared_mutex> lk(entry_mutex);
+       std::map<std::string,dns_entry>::const_iterator const it=
+       entries.find(domain);
+       return (it==entries.end())?dns_entry():it->second;
+     }
+     void update_or_add_entry(std::string const& domain,
+     dns_entry const& dns_details)
+     {
+       std::lock_guard<boost::shared_mutex> lk(entry_mutex);
+       entries[domain]=dns_details;
+     }
+  };
+  ```
+
+* With std::mutex, it’s an error for a thread to try to lock a mutex it already owns, and attempting to do so will result in undefined behavior;
+  * 当线程尝试对一个已经锁定的互斥量上锁时,可能发生错误,多次尝试会发生未知行为;
+* 使用`std::recursive_mutex`可以让一个互斥量在同一线程被多次上锁,但也需要相应次数的解锁;
+  * Most of the time, if you think you want a recursive mutex, you probably need to change your design instead;
+  * However, such usage is not recommended,because it can lead to sloppy thinking and bad design;
+    * 递归锁定是不推荐的;
