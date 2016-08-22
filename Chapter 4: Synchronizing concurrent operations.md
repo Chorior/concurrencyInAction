@@ -29,7 +29,7 @@
       * 等待事件被另一个线程触发最基本的措施是使用条件变量;
     * Conceptually, a condition variable is associated with some event or other condition, and one or more threads can wait for that condition to be satisfied. When some thread has determined that the condition is satisfied, it can then notify one or more of the threads waiting on the condition variable, in order to wake them up and allow them to continue processing;
       * 从概念上讲,一个条件变量与多个事件或其它条件相关,并且一个或更多线程会等待那个条件的达成;当某些线程确定那个条件达成时,它会通知一个或多个在条件变量上等待的线程,继而唤醒它们,继续工作;
-* C++标准库提供另个条件变量的实现
+* C++标准库提供两个条件变量的实现
   * 头文件: `<condition_variable>`;
   * `std::condition_variable`;
     * 只能与`std::mutex`一起使用;
