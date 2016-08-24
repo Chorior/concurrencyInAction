@@ -39,7 +39,7 @@
   * In both cases, they need to work with a mutex in order to provide appropriate synchronization;
     * 它们都需要一个互斥量进行同步;
   * `std::condition_variable`更受欢迎,除非灵活性需要;
-  * 示例
+  * 示例(有问题么?)
 
   ```C++
   #include <iostream>
@@ -126,3 +126,87 @@
     * calls the notify_one() member function on the std::condition_variable instance to notify the waiting thread (if there is one);
     * The implementation of wait() then checks the condition (by calling the supplied lambda function) and returns if it’s satisfied (the lambda function returned true ). If the condition isn’t satisfied (the lambda function returned false ), wait() unlocks the mutex and puts the thread in a blocked or waiting state. When the condition variable is notified by a call to notify_one() from the data-preparation thread, the thread wakes from its slumber (unblocks it), reacquires the lock on the mutex, and checks the condition again, returning from wait() with the mutex still locked if the condition has been satisfied. If the condition hasn’t been satisfied, the thread unlocks the mutex and resumes waiting;
     * During a call to wait() , a condition variable may check the supplied condition any number of times; however, it always does so with the mutex locked and will return immediately if (and only if) the function provided to test the condition returns true . When the waiting thread reacquires the mutex and checks the condition, if it isn’t in direct response to a notification from another thread, it’s called a spurious wake. Because the number and frequency of any such spurious wakes are by definition indeterminate, it isn’t advisable to use a function with side effects for the condition check. If you do so, you must be prepared for the side effects to occur multiple times;
+* 使用期望等待一次性事件
+  * If a thread needs to wait for a specific one-off event, it somehow obtains a future representing this event;
+    * 如果一个线程需要等待一个特定的一次性事件,那么它需要通过一些方法获取这个事件未来的表现形式;
+  * 这个线程会周期性的等待或检查事件是否触发,在检查间隙可以做其它的任务直到时间发生,然后等待期望状态变为"ready";
+  * 期望不能被重置;
+  * C++标准库实现了两种future模板
+    * 头文件`<future>`;
+    * unique futures(`std::future<>`);
+    * shared futures(`std::shared_future<>`);
+    * 分别仿照`std::unique_ptr`和`std::shared_ptr`;
+    * 一个`std::future<>`实例是它关联事件的唯一实例;
+    * 多个`std::shared_future<>`实例可以同时关联到同一個事件;这种情况下,所有实例会在同一时间变为ready状态,它们可能全部访问事件关联的数据;
+    * 模板参数是关联数据的类型,void表示事件无关联数据;
+    * 期望类不提供同步访问,如果多个线程需要访问同一个期望实例,那么它们需要通过互斥量或其它第三章的同步措施来保护访问;
+* 从后台任务中返回值
+  * 使用`std::async`启动一个不需要立即获取结果的异步任务;
+    * `std::async`返回一个`std::future`对象,这个对象最后持有函数的返回值;
+    * 对返回的future对象调用`get()`,线程阻塞直到future状态变为ready,然后返回结果;
+
+      ```C++
+      #include <future>
+      #include <iostream>
+      int find_the_answer_to_ltuae();
+      void do_other_stuff();
+      int main()
+      {
+         std::future<int> the_answer=std::async(find_the_answer_to_ltuae);
+         do_other_stuff();
+         std::cout<<"The answer is "<<the_answer.get()<<std::endl;
+      }
+      ```
+
+    * `std::async`第一个参数为函数指针或可调用对象,若是成员函数,则最后一个参数为相应的类实例(指针,引用或拷贝),而后为函数参数列表;
+
+      ```C++
+      #include <string>
+      #include <future>
+      struct X
+      {
+         void foo(int,std::string const&);
+         std::string bar(std::string const&);
+      };
+      X x;
+      auto f1=std::async(&X::foo,&x,42,"hello"); // Calls p->foo(42,"hello") where p is &x
+      auto f2=std::async(&X::bar,x,"goodbye"); // Calls tmpx.bar("goodbye") where tmpx is a copy of x
+      struct Y
+      {
+        double operator()(double);
+      };
+      Y y;
+      auto f3=std::async(Y(),3.141); // Calls tmpy(3.141) where tmpy is move-constructed from Y()
+      auto f4=std::async(std::ref(y),2.718); // Calls y(2.718)
+      X baz(X&);
+      std::async(baz,std::ref(x)); // Calls baz(x)
+      class move_only
+      {
+      public:
+         move_only();
+         move_only(move_only&&)
+         move_only(move_only const&) = delete;
+         move_only& operator=(move_only&&);
+         move_only& operator=(move_only const&) = delete;
+         void operator()();
+      };
+      auto f5=std::async(move_only()); // Calls tmp() where tmp is constructed from std::move(move_only())
+      ```
+
+    * 在‘std::sync’参数函数或可调用对象前添加额外参数
+      * `std::launch::deferred`指明函数延迟直到`wait()`或`get()`被future调用;
+        *  If the function call is deferred, it may never actually run;
+      * `std::launch::async`指明函数必须在它自己的线程运行;
+      * `std::launch::deferred | std::launch::async`指明由编译器选择;
+      * 不添加时,默认为`std::launch::deferred | std::launch::async`;
+
+      ```C++
+      auto f6=std::async(std::launch::async,Y(),1.2); // Run in new thread
+      auto f7=std::async(std::launch::deferred,baz,std::ref(x)); // Run in wait() or get()
+      auto f8=std::async(
+       std::launch::deferred | std::launch::async,
+       baz,std::ref(x)); // Implementation chooses
+      auto f9=std::async(baz,std::ref(x)); // // Implementation chooses
+      f7.wait();  // Invoke deferred function
+      ```
+      
