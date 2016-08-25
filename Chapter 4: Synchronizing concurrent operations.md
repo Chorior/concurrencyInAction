@@ -200,13 +200,42 @@
       * `std::launch::deferred | std::launch::async`指明由编译器选择;
       * 不添加时,默认为`std::launch::deferred | std::launch::async`;
 
-      ```C++
-      auto f6=std::async(std::launch::async,Y(),1.2); // Run in new thread
-      auto f7=std::async(std::launch::deferred,baz,std::ref(x)); // Run in wait() or get()
-      auto f8=std::async(
-       std::launch::deferred | std::launch::async,
-       baz,std::ref(x)); // Implementation chooses
-      auto f9=std::async(baz,std::ref(x)); // // Implementation chooses
-      f7.wait();  // Invoke deferred function
-      ```
-      
+        ```C++
+        auto f6=std::async(std::launch::async,Y(),1.2); // Run in new thread
+        auto f7=std::async(std::launch::deferred,baz,std::ref(x)); // Run in wait() or get()
+        auto f8=std::async(
+         std::launch::deferred | std::launch::async,
+         baz,std::ref(x)); // Implementation chooses
+        auto f9=std::async(baz,std::ref(x)); // // Implementation chooses
+        f7.wait();  // Invoke deferred function
+        ```
+
+* 使用future关联任务
+  * `std::packaged_task<>` ties a future to a function or callable object;
+    * `std::packaged_task<>`绑定一个future到一个函数或一个可调用对象;
+  * 当`std::packaged_task<>`对象被调用,它会调用关联的函数或可调用对象,并且使future状态变为ready,返回值也会被存储为关联数据;
+  * 如果一个大的任务可以被划分为独立的小任务,那么每个小任务都可以被包含在一个`std::packaged_task<>`实例中;
+  * `std::packaged_task<>`的模板参数是一个函数签名,void表示无返回值无参数函数, `int(std::string&,double*)`代表返回值为int,参数类型为`string &`,`double *`;
+  * 构造`std::packaged_task<>`实例时,必须传入一个函数或可调用对象,这个函数或可调用对象需要能接收指定的参数和返回可转换为指定返回类型的值,可以不完全匹配;
+    * 如`std::packaged_task<double(double)>`实例可以用float(int)函数构建;
+  * 函数签名返回类型指定`std::future<>`调用`get_future()`成员函数的返回类型;
+  * `std::packaged_task<>`对象是一个可调用对象
+    * 它可以包含在`std::function`对象中,然后传递给`std::thread`作为线程函数;
+    * 也可以传递给一个需要可调用对象的函数;
+    * 或者直接调用;
+  * 当`std::packaged_task<>`对象被当作一个函数对象调用时,返回值被存储在`std::future`中,通过`get_future()`获取;
+  * `std::packaged_task<>`的部分实现
+
+  ```C++
+  template<>
+  class packaged_task<std::string(std::vector<char>*,int)>
+  {
+  public:
+     template<typename Callable>
+     explicit packaged_task(Callable&& f);
+     std::future<std::string> get_future();
+     void operator()(std::vector<char>*,int);
+  };
+  ```
+
+* 线程间传递任务
