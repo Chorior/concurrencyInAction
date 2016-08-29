@@ -9,20 +9,20 @@
   * 在等待完成期间,使用`std::this_thread::sleep_for()`函数进行周期时间间歇;
     * 难以确定合适的休息时间;
 
-  ```C++
-  bool flag;
-  std::mutex m;
-  void wait_for_flag()
-  {
-     std::unique_lock<std::mutex> lk(m);
-     while(!flag)
-     {
-       lk.unlock();
-       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-       lk.lock();
-     }
-  }
-  ```
+      ```C++
+      bool flag;
+      std::mutex m;
+      void wait_for_flag()
+      {
+         std::unique_lock<std::mutex> lk(m);
+         while(!flag)
+         {
+           lk.unlock();
+           std::this_thread::sleep_for(std::chrono::milliseconds(100));
+           lk.lock();
+         }
+      }
+      ```
 
   * 使用Ｃ++标准库工具等待时间本身(最好的选择)
     * The most basic mechanism for waiting for an event to be triggered by another thread is the condition variable;
@@ -41,78 +41,78 @@
   * `std::condition_variable`更受欢迎,除非灵活性需要;
   * 示例(有问题么?)
 
-  ```C++
-  #include <iostream>
-  #include <mutex>
-  #include <thread>
-  #include <condition_variable>
-  #include <queue>
-  #include <string>
+    ```C++
+    #include <iostream>
+    #include <mutex>
+    #include <thread>
+    #include <condition_variable>
+    #include <queue>
+    #include <string>
 
-  std::mutex mut;
-  std::queue<std::string> data_queue;
-  std::condition_variable data_cond;
+    std::mutex mut;
+    std::queue<std::string> data_queue;
+    std::condition_variable data_cond;
 
-  void data_preparation(std::string data)
-  {
-    std::cout << "data_preparation() called!\n";
-    std::lock_guard<std::mutex> lk(mut);
-    data_queue.push(data);
-    data_cond.notify_one();
-  }
-
-  void data_processing()
-  {
-    std::cout << "data_processing() called!\n";
-    while(true)
+    void data_preparation(std::string data)
     {
-      std::unique_lock<std::mutex> lk(mut);
-      data_cond.wait(
-      lk,[]{return !data_queue.empty();});
-      std::string data = data_queue.front();
-      data_queue.pop();
-      lk.unlock();
+      std::cout << "data_preparation() called!\n";
+      std::lock_guard<std::mutex> lk(mut);
+      data_queue.push(data);
+      data_cond.notify_one();
+    }
 
-      std::cout << "data = " << data << std::endl;
-
-      if("quit" == data)
+    void data_processing()
+    {
+      std::cout << "data_processing() called!\n";
+      while(true)
       {
-        break;
+        std::unique_lock<std::mutex> lk(mut);
+        data_cond.wait(
+        lk,[]{return !data_queue.empty();});
+        std::string data = data_queue.front();
+        data_queue.pop();
+        lk.unlock();
+
+        std::cout << "data = " << data << std::endl;
+
+        if("quit" == data)
+        {
+          break;
+        }
       }
     }
-  }
 
-  void thread_a(std::string data)
-  {
-    std::thread t(data_preparation,data);
-    t.join();
-  }
-
-  void thread_b()
-  {
-    std::thread t(data_processing);
-    t.join();
-  }
-
-  int main()
-  {
-    while(true)
+    void thread_a(std::string data)
     {
-      std::cout << "please input a string(quit to end): ";
-      std::string data;
-      getline(std::cin,data);
-      thread_a(data);
-
-      if("quit" == data)
-      {
-        break;
-      }
+      std::thread t(data_preparation,data);
+      t.join();
     }
-    thread_b();
 
-    return EXIT_SUCCESS;
-  }
-  ```
+    void thread_b()
+    {
+      std::thread t(data_processing);
+      t.join();
+    }
+
+    int main()
+    {
+      while(true)
+      {
+        std::cout << "please input a string(quit to end): ";
+        std::string data;
+        getline(std::cin,data);
+        thread_a(data);
+
+        if("quit" == data)
+        {
+          break;
+        }
+      }
+      thread_b();
+
+      return EXIT_SUCCESS;
+    }
+    ```
 
   * 数据处理线程使用`std::unique_lock`是为了方便解锁和上锁;
   * `std::condition_variable`成员函数`wait()`
@@ -226,16 +226,158 @@
   * 当`std::packaged_task<>`对象被当作一个函数对象调用时,返回值被存储在`std::future`中,通过`get_future()`获取;
   * `std::packaged_task<>`的部分实现
 
-  ```C++
-  template<>
-  class packaged_task<std::string(std::vector<char>*,int)>
-  {
-  public:
-     template<typename Callable>
-     explicit packaged_task(Callable&& f);
-     std::future<std::string> get_future();
-     void operator()(std::vector<char>*,int);
-  };
-  ```
+      ```C++
+      template<>
+      class packaged_task<std::string(std::vector<char>*,int)>
+      {
+      public:
+         template<typename Callable>
+         explicit packaged_task(Callable&& f);
+         std::future<std::string> get_future();
+         void operator()(std::vector<char>*,int);
+      };
+      ```
 
 * 线程间传递任务
+
+  ```C++
+  #include <deque>
+  #include <mutex>
+  #include <future>
+  #include <thread>
+  #include <utility>
+
+  std::mutex m;
+  std::deque<std::packaged_task<void()> > tasks;
+  bool gui_shutdown_message_received();
+  void get_and_process_gui_message();
+
+  void gui_thread()
+  {
+    while(!gui_shutdown_message_received())
+    {
+      get_and_process_gui_message();
+      std::packaged_task<void()> task;
+      {
+      std::lock_guard<std::mutex> lk(m);
+      if(tasks.empty())
+        continue;
+      task=std::move(tasks.front());
+      tasks.pop_front();
+      }
+      task();
+    }
+  }
+  std::thread gui_bg_thread(gui_thread);
+  template<typename Func>
+  std::future<void> post_task_for_gui_thread(Func f)
+  {
+    std::packaged_task<void()> task(f);
+    std::future<void> res=task.get_future();
+    std::lock_guard<std::mutex> lk(m);
+    tasks.push_back(std::move(task));
+    return res;
+  }
+  ```
+
+* 使用 `std::promise`
+  * `std::promise<T>` provides a means of setting a value (of type T ), which can later be read through an associated `std::future<T>` object. A `std::promise / std::future` pair would provide one possible mechanism for this facility; the waiting thread could block on the future, while the thread providing the data could use the promise half of the pairing to set the associated value and make the future ready;
+    * `std::promise<T>`提供一种设置值的方法,这个值可以在设置之后被关联的`std::future<T>`对象读取;
+    * 一个`std::promise / std::future`对可以实现上面的机制;
+    * 等待的线程会在future上阻塞,提供数据的线程会根据promise去设置关联的值,并使future ready;
+  * 可以通过调用`get_future()`成员函数获取一个给定的`std::promise`关联的`std::future`对象;
+  * 在使用`set_value()`成员函数设定promise的值后,关联的future变为ready,且可以被用来获取存储的值;
+  * 如果在设置promise值之前销毁`std::promise`,future会存储异常;
+
+    ```C++
+    #include <future>
+    void process_connections(connection_set& connections)
+    {
+      while(!done(connections))
+      {
+        for(connection_iterator
+        connection=connections.begin(),end=connections.end();
+        connection!=end;
+        ++connection)
+        {
+          if(connection->has_incoming_data())
+          {
+            data_packet data=connection->incoming();
+            std::promise<payload_type>& p=
+            connection->get_promise(data.id);
+            p.set_value(data.payload);
+          }
+          if(connection->has_outgoing_data())
+          {
+            outgoing_packet data=
+            connection->top_of_outgoing_queue();
+            connection->send(data.payload);
+            data.promise.set_value(true);
+          }
+        }
+      }
+    }
+    ```
+
+* 为 future 存储异常
+  * 当`std::async`或`std::packaged_task`或`std::promise`调用的函数发生异常时,异常会存储在`std::future`中,通过相应获取future的方法来获取异常;
+  * 在`std::promise`中,如果你想存储一个异常而不是值,可以调用`set_exception()`代替`set_value()`;
+
+    ```C++
+    extern std::promise<double> some_promise;
+    try
+    {
+      some_promise.set_value(calculate_value());
+    }
+    catch(...)
+    {
+      some_promise.set_exception(std::current_exception());
+    }
+    ```
+
+  * 上面使用`std::current_exception()`获取抛出的异常;
+  * 可以使用`std::copy_exception()`直接存储一个新的异常而不用抛出
+
+    ```C++
+    some_promise.set_exception(std::copy_exception(std::logic_error("foo ")));
+    ```
+
+  * 在future中存储异常的另一个方式是
+    * Another way to store an exception in a future is to destroy the `std::promise` or `std::packaged_task` associated with the future without calling either of the set functions on the promise or invoking the packaged task. In either case, the destructor of the `std::promise` or `std::packaged_task` will store a `std::future_error` exception with an error code of `std::future_errc::broken_promise` in the associated state if the future isn’t already ready;
+    * 在调用set函数或包装人物前就相会了future关联的`std::promise`或`std::packaged_task`,如果这时future没有ready，那么析构函数就会存储一个与`std::future_errc::broken_promise`错误状态相关的`std::future_error`异常;
+  * `std::future`的局限性
+    * 只有一个线程能够等待future结果;
+    * 当有很多线程等待同一事件时,需要使用`std::shared_future`;
+* 多个线程的等待
+  * `std::future` is only moveable;
+  * `std::shared_future` instances are copyable;
+  * Now, with `std::shared_future` , member functions on an individual object are still unsynchronized, so to avoid data races when accessing a single object from multiple threads, you must protect accesses with a lock. The preferred way to use it would be to take a copy of the object instead and have each thread access its own copy. Accesses to the shared asynchronous state from multiple threads are safe if each thread accesses that state through its own `std::shared_future` object;
+
+    ```C++
+    std::promise<int> p;
+    std::future<int> f(p.get_future());
+    assert(f.valid()); // The future f is valid
+    std::shared_future<int> sf(std::move(f));
+    assert(!f.valid()); // f is no longer valid
+    assert(sf.valid()); // sf is now valid
+    ```
+
+    ![shared_future](http://o7s72jtji.bkt.clouddn.com/std::shared_future)
+
+  * you can construct a std::shared_future directly from the return value of the `get_future()` member function of a `std::promise` object
+
+    ```C++
+    std::promise<std::string> p;
+    std::shared_future<std::string> sf(p.get_future());
+    // Implicit transfer of ownership
+    ```
+
+  * `std::future` has a share() member function that creates a new `std::shared_future` and transfers ownership to it directly
+
+    ```C++
+    std::promise< std::map< SomeIndexType, SomeDataType,
+      SomeComparator,SomeAllocator>::iterator> p;
+    auto sf=p.get_future().share();
+    ```
+
+* 超时等待
