@@ -381,3 +381,51 @@
     ```
 
 * 超时等待
+  * 基于持续时间(duration-based)的超时(如20s)有`_for`后缀;
+  * 基于绝对时间(absolute)的超时(如2019.3.31)有`_until`后缀;
+  * 稳定的时钟对于超时运算非常重要;  
+  * 头文件`<chrono>`
+    * `std::chrono::system_clock`不是稳定的;
+    * `std::chrono::steady_clock.`是稳定的;
+  * std::chrono::system_clock::now() will return the current time of the system clock;
+  * The is_steady static data member of the clock class is true if the clock is steady and false otherwise;
+* 持续时间(durations)用`std::chrono::duration<>`模板类进行处理(我发现使用英文记录比翻译要快多了,为什么要翻译呢,对吧)
+  * The first template parameter is the type of the representation (such as int, long, or double);
+  * the second is a fraction specifying how many seconds each unit of the duration represents;
+  * example
+    * a number of minutes stored in a short is `std::chrono::duration<short,std::ratio<60,1>>`, because there are 60 seconds in a minute;
+    * a count of milliseconds stored in a double is `std::chrono::duration<double,std::ratio<1,1000>>`, because each millisecond is 1/1000 of a second;
+  * The Standard Library provides a set of predefined typedefs in the `std::chrono` namespace for various durations
+    * nanoseconds;
+    * microseconds;
+    * milliseconds;
+    * seconds;
+    * minutes;
+    * hours
+  * Conversion between durations is implicit where it does not require truncation of the value (so converting hours to seconds is OK, but converting seconds to hours is not).Explicit conversions can be done with `std::chrono::duration_cast<>`
+    * The result is truncated rather than rounded, so s will have a value of 54 in this example
+
+      ```C++
+      std::chrono::milliseconds ms(54802);
+      std::chrono::seconds s=
+          std::chrono::duration_cast<std::chrono::seconds>(ms);
+      ```
+
+  * Durations support arithmetic
+    * `5*seconds(1)` is the same as `seconds(5)` or `minutes(1) – seconds(55)`;
+  * The count of the number of units in the duration can be obtained with the count() member function
+      * `std::chrono::milliseconds(1234).count()` is 1234;
+  * Duration-based waits are done with instances of `std::chrono::duration<>`;
+    * wait for up to 35 milliseconds for a future to be ready
+
+      ```C++
+      std::future<int> f = std::async(some_task);
+      if(f.wait_for(std::chrono::milliseconds(35)) == std::future_status::ready)
+       do_something_with(f.get());
+      ```
+    * The wait functions all return a status to indicate whether the wait timed out or the waitedfor event occurred;
+      * if you are waiting for a future
+        * the wait function returns `std::future_status::timeout` if the wait times out;
+        * `std::future_status::ready` if the future is ready;
+        * `std::future_status::deferred` if the future’s task is deferred;
+    * The time for a duration-based wait is measured using a steady clock internal to the library，so 35 milliseconds means 35 milliseconds of elapsed time, even if the system clock was adjusted (forward or back) during the wait;
