@@ -429,3 +429,59 @@
         * `std::future_status::ready` if the future is ready;
         * `std::future_status::deferred` if the future’s task is deferred;
     * The time for a duration-based wait is measured using a steady clock internal to the library，so 35 milliseconds means 35 milliseconds of elapsed time, even if the system clock was adjusted (forward or back) during the wait;
+* Time points
+  * the time point for a clock is represented by an instance of the `std::chrono::time_point<>` class template
+    * the first template parameter specifies which clock it refers to;
+    * the second template parameter specifies the units of measurement(a specialization of `std::chrono::duration<>`);
+  * the value of a time point is the length of time (in multiples of the specified duration) since a specific point in time called the epoch of the clock(时间段);
+    * Typical epochs include 00:00 on January 1, 1970 and the instant when the computer running the application booted up;
+    * The epoch of a clock is a basic property but not something that’s directly available to query or specified by the C++ Standard;
+    * Although you can’t find out when the epoch is, you can get the `time_since_epoch()` for a given time_point . This member function returns a duration value specifying the length of time since the clock epoch to that particular time point;
+  * `std::chrono::time_point<std::chrono::system_clock, std::chrono::minutes>`would hold the time relative to the system clock but measured in minutes as opposed to the native precision of the system clock (which is typically seconds or less);
+  * You can add durations and subtract durations from instances of `std::chrono::time_point<>` to produce new time points
+    * `std::chrono::high_resolution_clock::now() + std::chrono::nanoseconds(500)` will give you a time 500 nanoseconds in the future;
+
+      ```C++
+      auto start=std::chrono::high_resolution_clock::now();
+      do_something();
+      auto stop=std::chrono::high_resolution_clock::now();
+      std::cout<<”do_something() took “
+        <<std::chrono::duration<double,std::chrono::seconds>(stop-start).count()
+        <<” seconds”<<std::endl;
+      ```
+
+  * When you pass the time point to a wait function that takes an absolute timeout, the clock parameter of the time point is used to measure the time;
+  * below is the recommended way to wait for condition variables with a time limit, if you’re not passing a predicate to the wait
+    * predicate?
+
+    ```C++
+    #include <condition_variable>
+    #include <mutex>
+    #include <chrono>
+    std::condition_variable cv;
+    bool done;
+    std::mutex m;
+    bool wait_loop()
+    {
+      auto const timeout= std::chrono::steady_clock::now()+
+      std::chrono::milliseconds(500);
+      std::unique_lock<std::mutex> lk(m);
+      while(!done)
+      {
+        if(cv.wait_until(lk,timeout)==std::cv_status::timeout)
+        break;
+      }
+      return done;
+    }
+    ```
+
+* Functions that accept timeouts
+  * `std::this_thread::sleep_for()`: the thread goes to sleep for the specified duration;
+  * `std::this_thread::sleep_until()`: the thread goes to sleep until the specified point in time;
+  * `std::timed_mutex` and `std::recursive_timed_mutex` support timeouts on locking
+    * Both these types support `try_lock_for()` and `try_lock_until()` member functions;
+  * table(Functions that accept timeouts)
+
+    ![Functions that accept timeouts](http://o7s72jtji.bkt.clouddn.com/Functions%20that%20accept%20timeouts)
+
+* Using synchronization of operations to simplify code
