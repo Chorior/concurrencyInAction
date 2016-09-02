@@ -485,3 +485,98 @@
     ![Functions that accept timeouts](http://o7s72jtji.bkt.clouddn.com/Functions%20that%20accept%20timeouts)
 
 * Using synchronization of operations to simplify code
+  * The term functional programming ( FP ) refers to a style of programming where the result of a function call depends solely on the parameters to that function and doesn’t depend on any external state;
+    * it means that if you invoke a function twice with the same parameters, the result is exactly the same;
+  * FP - STYLE Q UICKSORT
+
+    ![FP-style recursive sorting](http://o7s72jtji.bkt.clouddn.com/FP-style%20recursive%20sorting)
+
+    ```C++
+    template<typename T>
+    std::list<T> sequential_quick_sort(std::list<T> input)
+    {
+      if(input.empty())
+      {
+        return input;
+      }
+      std::list<T> result;
+      result.splice(result.begin(),input,input.begin());
+
+      T const& pivot = *result.begin();        
+      auto divide_point=std::partition(input.begin(),input.end(),
+        [&](T const& t){return t<pivot;});    
+
+      std::list<T> lower_part;
+      lower_part.splice(lower_part.end(),input,input.begin(),divide_point);    
+
+      auto new_lower(
+        sequential_quick_sort(std::move(lower_part)));
+      auto new_higher(
+        sequential_quick_sort(std::move(input)));
+
+      result.splice(result.end(),new_higher);
+      result.splice(result.begin(),new_lower);
+
+      return result;        
+    }
+    ```
+
+    * `std::partition()` rearranges the list in place and returns an iterator marking the first element that’s not less than the pivot value;
+    * using `std::move` to avoid copying;
+  * FP - STYLE PARALLEL Q UICKSORT
+    ```C++
+    template<typename T>
+    std::list<T> parallel_quick_sort(std::list<T> input)
+    {
+      if(input.empty())
+      {
+        return input;
+      }
+      std::list<T> result;
+      result.splice(result.begin(),input,input.begin());
+
+      T const& pivot=*result.begin();
+      auto divide_point=std::partition(input.begin(),input.end(),
+        [&](T const& t){return t<pivot;});
+
+      std::list<T> lower_part;
+      lower_part.splice(lower_part.end(),input,input.begin(),divide_point);
+
+      std::future<std::list<T> > new_lower(
+        std::async(&parallel_quick_sort<T>,std::move(lower_part)));
+
+      auto new_higher(
+        parallel_quick_sort(std::move(input)));
+
+      result.splice(result.end(),new_higher);
+      result.splice(result.begin(),new_lower.get());
+
+      return result;
+    }
+    ```
+
+    * rather than using `std::async()` , you could write your own spawn_task() function as a simple wrapper around `std::packaged_task`
+
+      ```C++
+      template<typename F,typename A>
+      std::future<std::result_of<F(A&&)>::type>
+      spawn_task(F&& f,A&& a)
+      {
+        typedef std::result_of<F(A&&)>::type result_type;
+        std::packaged_task<result_type(A&&)>
+        task(std::move(f)));
+        std::future<result_type> res(task.get_future());
+        std::thread t(std::move(task),std::move(a));
+        t.detach();
+        return res;
+      }
+      ```
+
+    * Functional programming isn’t the only concurrent programming paradigm that eschews shared mutable data; another paradigm is CSP (Communicating Sequential Processes), where threads are conceptually entirely separate, with no shared data but with communication channels that allow messages to be passed between them;
+
+* Synchronizing operations with message passing
+  * The idea of CSP is simple: if there’s no shared data, each thread can be reasoned about entirely independently, purely on the basis of how it behaves in response to the messages that it received;
+
+    ![A simple state machine model for an ATM](http://o7s72jtji.bkt.clouddn.com/A%20simple%20state%20machine%20model%20for%20an%20ATM)
+
+    code here
