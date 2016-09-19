@@ -9,7 +9,7 @@
   * All data in a C++ program is made up of objects;
   * Whatever its type, an object is stored in one or more memory locations;
 
-    ![]()
+    ![memory model basics](https://github.com/Chorior/concurrencyInAction/blob/master/picture/memory%20model%20basics.png)
 
   * There are four important things to take away from this
     * Every variable is an object, including those that are members of other objects;
