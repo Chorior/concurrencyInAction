@@ -212,4 +212,105 @@
             b.compare_exchange_weak(expected,true,memory_order_acq_rel);
             ```
 
-          * 
+    * `std::atomic<T*>`
+      * The new operations provided by `std::atomic<T*>` are the pointer arithmetic operations;
+        * `fetch_add()`: do atomic addition on the stored address;
+        * `fetch_sub()`: do atomic subtraction on the stored address;
+        * ++,--,+=,-=;
+      * `fetch_add()` and `fetch_sub()` update the pointer but return the original value;
+
+        ```C++
+        class Foo{};
+        Foo some_array[5];
+        std::atomic<Foo*> p(some_array);
+        Foo* x=p.fetch_add(2);
+        assert(x==some_array);
+        assert(p.load()==&some_array[2]);
+        x=(p-=1);
+        assert(x==&some_array[1]);
+        assert(p.load()==&some_array[1]);
+        ```
+
+      * The function forms also allow the memory-ordering semantics to be specified as an additional function call argument
+
+        ```C++
+        p.fetch_add(3,std::memory_order_release);
+        ```
+
+      * both `fetch_add()` and `fetch_sub()` are read-modify-write operations;
+      * Specifying the ordering semantics isn’t possible for the operator forms
+        * because there’s no way of providing the information;
+        * these forms therefore always have `memory_order_seq_cst` semantics;
+    * standard atomic integral types
+      * usual set
+        * `load()`;
+        * `store()`;
+        * `exchange()`;
+        * `compare_exchange_weak()`;
+        * `compare_exchange_strong()`;
+      * comprehensive set
+        * `fetch_add()`;
+        * `fetch_sub()`;
+        * `fetch_and()`;
+        * `fetch_or()`;
+        * `fetch_xor()`;
+      * compound-assignment forms
+        * +=, -=, &=, |=, ^=
+        * ++, --
+      * additional operations can easily be done using `compare_exchange_weak()` in a loop, if required;
+    * The `std::atomic<>` primary class template
+      * `std::atomic<>` allows a user to create an atomic variant of a user-defined type
+        * in order to use `std::atomic<UDT>` for some user-defined type UDT
+          * this type must have a trivial copy-assignment operator
+            * the type must not have any virtual functions or virtual base classes;
+            * the type must use the compiler-generated copy-assignment operator;
+          * every base class and non-static data member of a userdefined type must also have a trivial copy-assignment operator;
+          * the type must be bitwise equality comparable
+            * you must be able to copy an object of type UDT using `memcpy()`;
+            * you must be able to compare instances for equality using `memcmp()`;
+            * This guarantee is required in order for compare/exchange operations to work;
+        * the compiler isn’t going to be able to generate lock-free code for `std::atomic<UDT>`
+          * you will have to use internal lock for all the operations;
+      * there are no atomic arithmetic operations on floating-point values;
+      * If your UDT is the same size as (or smaller than) an int or a `void*`,  
+        most common platforms will be able to use atomic instructions for `std::atomic<UDT>`;
+      * Some platforms will also be able to use atomic instructions for user-defined types  
+        that are twice the size of an int or `void*`;
+        * These platforms are typically those that support a so-called double-word-compare-and-swap (DWCAS) instruction  
+          corresponding to the `compare_exchange_xxx` functions;
+    * Free functions for atomic operations
+      * there are also equivalent nonmember functions for all the operations on the various atomic types;
+
+        ![Table 5.3](https://github.com/Chorior/concurrencyInAction/blob/master/picture/Table%205.3.png)
+
+      * Where there’s opportunity for specifying a memoryordering tag, they come in two varieties
+        * one without the tag;
+        * one with an `_explicit` suffix and an additional parameter or parameters for the memory-ordering tag or tags;
+          * `std::atomic_store(&atomic_var,new_value)`;
+          * `std::atomic_store_explicit(&atomic_var,new_value,std::memory_order_release)`;
+          * `std::atomic_is_lock_free(&a)` returns the same value as `a.is_lock_free()` for an object of atomic type a;
+          * `std::atomic_load(&a)` is the same as `a.load()`;
+          * `a.load(std::memory_order_acquire)` equal to `std::atomic_load_explicit(&a, std::memory_order_acquire)`;
+      * The operations on `std::atomic_flag` buck the trend, in that they spell out the “flag” part in the names
+        * `std::atomic_flag_test_and_set()`;
+        * `std::atomic_flag_clear()`;
+        * `std::atomic_flag_test_and_set_explicit()`;
+        * `std::atomic_flag_clear_explicit()`;
+      * The C++ Standard Library also provides free functions for accessing instances of `std::shared_ptr<>`  
+        in an atomic fashion, which taking a `std::shared_ptr<>*` as the first argument;
+
+        ```C++
+        std::shared_ptr<my_data> p;
+        void process_global_data()
+        {
+          std::shared_ptr<my_data> local=std::atomic_load(&p);
+          process_data(local);
+        }
+        void update_global_data()
+        {
+          std::shared_ptr<my_data> local(new my_data);
+          std::atomic_store(&p,local);
+        }
+        ```
+
+  * Synchronizing operations and enforcing ordering
