@@ -579,4 +579,4 @@
 
     ![A simple state machine model for an ATM](http://o7s72jtji.bkt.clouddn.com/A%20simple%20state%20machine%20model%20for%20an%20ATM)
 
-    code here
+    code here<https://github.com/Chorior/commonCodes/tree/master/C%2B%2B/state%20machine>
