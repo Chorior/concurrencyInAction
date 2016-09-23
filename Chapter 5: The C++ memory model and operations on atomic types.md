@@ -314,3 +314,145 @@
         ```
 
   * Synchronizing operations and enforcing ordering
+
+    ```C++
+    #include <vector>
+    #include <atomic>
+    #include <iostream>
+    std::vector<int> data;
+    std::atomic<bool> data_ready(false);
+    void reader_thread()
+    {
+      while(!data_ready.load())
+      {
+        std::this_thread::sleep(std::milliseconds(1));
+      }
+      std::cout<<”The answer=”<<data[0]<<”\n”;
+    }
+    void writer_thread()
+    {
+      data.push_back(42);
+      data_ready=true;
+    }
+    ```
+
+    ![Figure 5.2](https://github.com/Chorior/concurrencyInAction/blob/master/picture/Figure%205.2.png)
+
+    * memory model relations synchronizes-with
+      * the synchronizes-with relationship is something that you can get only between operations on atomic types;
+      * all operations on atomic types are suitably tagged by default;
+      * if thread A stores a value and thread B reads that value,  
+        there’s a synchronizes-with relationship between the store in thread A and the load in thread B;
+    * memory model relations happens-before
+      * The happens-before relationship is the basic building block of operation ordering in a program;
+      * it specifies which operations see the effects of which other operations;
+      * if one operation (A) occurs in a statement prior to another (B) in the source code, then A happens-before B;
+      * code below will output “1,2” or “2,1”,because the order of the two calls to `get_num()` is unspecified
+
+        ```C++
+        #include <iostream>
+        void foo(int a,int b)
+        {
+          std::cout<<a<<”,”<<b<<std::endl;
+        }
+        int get_num()
+        {
+          static int i=0;
+          return ++i;
+        }
+        int main()
+        {
+          foo(get_num(),get_num());
+        }
+        ```
+
+      * in general, operations within a single statement are nonsequenced,  
+        and there’s no sequenced-before (and thus no happens-before) relationship between them;
+      * if operation A on one thread inter-thread happens-before operation B on another thread, then A happens-before B;
+      * inter-thread happens-before is relatively simple and relies on the synchronizes-with relationship
+        * if operation A in one thread synchronizes-with operation B in another thread, then A inter-thread happensbefore B;
+        * if A inter-thread happens-before B and B interthread happens-before C, then A inter-thread happens-before C;
+      * Inter-thread happens-before also combines with the sequenced-before relation
+        * if operation A is sequenced before operation B, and operation B inter-thread happensbefore operation C,  
+          then A inter-thread happens-before C;
+        * if A synchronizeswith B and B is sequenced before C, then A inter-thread happens-before C;
+    * Memory ordering for atomic operations
+      * There are six memory ordering options that can be applied to operations on atomic types
+        * `memory_order_relaxed`;
+        * `memory_order_consume`;
+        * `memory_order_acquire`;
+        * `memory_order_release`;
+        * `memory_order_acq_rel`;
+        * `memory_order_seq_cst`;
+      * `memory_order_seq_cst` is the default memory-ordering option for all operations on atomic types;
+      * six ordering options represent three models
+        * sequentially consistent ordering
+          * `memory_order_seq_cst`;
+        * acquire-release ordering
+          * `memory_order_consume`;
+          * `memory_order_acquire`;
+          * `memory_order_release`;
+          * `memory_order_acq_rel`;
+        * relaxed ordering
+          * `memory_order_relaxed`;
+      * These distinct memory-ordering models can have varying costs on different CPU architectures;
+      * sequentially consistent ordering
+        * Sequential consistency is the most straightforward and intuitive ordering;
+        * but it’s also the most expensive memory ordering because it requires global synchronization between all threads;
+        * If all operations on instances of atomic types are sequentially consistent,  the behavior of a multithreaded program  
+          is as if all these operations were performed in some particular sequence by a single thread;
+        * if your code has one operation before another in one thread, that ordering must be seen by all other threads;
+        * you must use sequentially consistent operations on all your threads;
+
+          ```C++
+          #include <atomic>
+          #include <thread>
+          #include <assert.h>
+          std::atomic<bool> x,y;
+          std::atomic<int> z;
+          void write_x()
+          {
+            x.store(true,std::memory_order_seq_cst);
+          }
+          void write_y()
+          {
+            y.store(true,std::memory_order_seq_cst);
+          }
+          void read_x_then_y()
+          {
+            while(!x.load(std::memory_order_seq_cst));
+            if(y.load(std::memory_order_seq_cst))
+            ++z;
+          }
+          void read_y_then_x()
+          {
+            while(!y.load(std::memory_order_seq_cst));
+            if(x.load(std::memory_order_seq_cst))
+            ++z;
+          }
+          int main()
+          {
+            x=false;
+            y=false;
+            z=0;
+            std::thread a(write_x);
+            std::thread b(write_y);
+            std::thread c(read_x_then_y);
+            std::thread d(read_y_then_x);
+            a.join();
+            b.join();
+            c.join();
+            d.join();
+            assert(z.load()!=0);
+          }
+          ```
+
+        * either the store to x B or the store to y must happen first, even though it’s not specified which;
+        * for there to be a single total order
+          * if one thread sees `x==true` and then subsequently sees `y==false`,  
+            this implies that the store to x occurs before the store to y in this total order;
+          * otherwise the opposite;
+
+            ![Figure 5.3](https://github.com/Chorior/concurrencyInAction/blob/master/picture/Figure%205.3.png)
+
+      * non-sequentially consistent memory orderings
