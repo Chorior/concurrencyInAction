@@ -15,6 +15,7 @@ tags:
 *   [多线程概述](#multithreading_overview)
 *   [多线程管理](#managing_threads)
 *   [多线程识别](#thread_identification)
+*   [线程间共享数据](#sharing_data_between_threads)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
@@ -217,7 +218,7 @@ public:
 
 detach线程又称守护线程(daemon threads)，**C++运行库保证，当detach线程退出时，相关资源的能够正确回收，后台线程的归属和控制C++运行库都会处理**。
 
-<h3 id="start_a_thread">线程启动</h3>
+<h2 id="start_a_thread">线程启动</h2>
 
 **使用C++线程库开启一个线程通常归结为构造一个`std::thread`类对象**。
 
@@ -358,12 +359,12 @@ void f()
 } 
 ```
 
-<h3 id="thread_identification">多线程识别</h3>
+<h2 id="thread_identification">多线程识别</h2>
 
 线程标识类型是`std::thread::id`，这个值可以通过两种方式进行检索：
 
 *   成员函数`std::thread::get_id()`，当没有线程与该thread对象关联时，此函数返回0；
-*   当前线程中调用`std::this_thread::get_id()`；
+*   命名空间函数`std::this_thread::get_id()`；
 
 如果两个对象的`std::thread::id`相等，那它们就是同一个线程，或者都“没有线程”。如果不等，那么就代表了两个不同线程，或者一个有线程，另一没有。
 
@@ -423,3 +424,212 @@ template<>
 ```
 
 查看`std::thread::id`源代码，发现其支持`==,!=,<,<=,>,>=,<<`运算符，还定义了hash模板的特例化版本，所以`std::thread::id`支持各种算法和无序容器，甚至可以用来作为键值。
+
+<h2 id="sharing_data_between_threads">线程间共享数据</h2>
+
+条件竞争(race condition)：当一个线程A正在修改共享数据时，另一个线程B却在使用这个共享数据，这时B访问到的数据可能不是正确的数据，这种情况称为条件竞争。
+
+数据竞争(data race)：一种特殊的条件竞争；并发的去修改一个独立对象。
+
+多线程的一个关键优点(key benefit)是可以简单的直接共享数据，但如果有多个线程拥有修改共享数据的权限，那么就会很容易出现数据竞争(data race)。
+
+### 使用mutex
+
+**C++标准保护共享数据最基本的技巧是使用互斥量(mutex)**：当访问共享数据前，使用互斥量将相关数据锁住，再当访问结束后，再将数据解锁。线程库需要保证，当一个线程使用特定互斥量锁住共享数据时，其他的线程想要访问锁住的数据，都必须等到之前那个线程对数据进行解锁后，才能进行访问。
+
+在C++中使用互斥量
+
+*	创建互斥量：建造一个`std::mutex`的实例；
+*	锁住互斥量：调用成员函数`lock()`；
+*	释放互斥量：调用成员函数`unlock()`；
+*	由于`lock()`与`unlock()`必须配对，就像new和delete一样，所以为了方便和异常处理，C++标准库也专门提供了一个模板类`std::lock_guard`，其在构造时lock互斥量,析构时unlock互斥量。
+
+`std::mutex`和`std::lock_guard`定义于头文件`<mutex>`中。
+
+```c++
+// std::mutex 使用示例
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <set>
+
+using namespace std;
+
+class Example{
+private:
+	set<int> mySet;
+	mutex myMutex;
+public:
+	Example() = default;
+	~Example() = default;
+	Example(const Example&) = delete;
+	Example& operator=(const Example&) = delete;
+
+	void add_to_set(int val) {
+		lock_guard<mutex> lg(myMutex);
+		mySet.emplace(val);
+	}
+
+	bool set_contains(int val) {
+		lock_guard<mutex> lg(myMutex);
+		return mySet.find(val) != mySet.cend();
+	}
+
+	void print_set() {
+		lock_guard<mutex> lg(myMutex);
+		for (auto &i : mySet) {
+			cout << i << " ";
+		}
+	}
+};
+
+void thread1(Example &e) {
+	for (int i = 0; i < 10; ++i) {
+		e.add_to_set(i);
+	}
+}
+
+void thread2(Example &e) {
+	for (int i = 0; i < 10; ++i) {
+		cout << e.set_contains(i);
+	}
+	cout << endl;
+}
+
+int main()
+{		
+	Example e;
+
+	auto t1 = thread(thread1, std::ref(e));
+	auto t2 = thread(thread2, std::ref(e));
+	t1.join();
+	t2.join();
+
+	e.print_set();
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果如下：
+
+```text
+1111111111
+0 1 2 3 4 5 6 7 8 9
+```
+
+**具有访问能力的指针或引用可以访问(并可能修改)被保护的数据，而不会被互斥锁限制**，所以接口的设计一定要确保互斥量能锁住任何对保护数据的访问，并且不留后门。
+
+**切勿将受保护数据的指针或引用传递到互斥锁作用域之外，无论是函数返回值，还是存储在外部可见内存，亦或是以参数的形式传递到用户提供的函数中去**。
+
+```c++
+// 错误示例
+// 假设Example定义了set<int>* get_set(){return &mySet;} 
+set<int> *is = e.get_set();
+auto t1 = thread(thread1, std::ref(e));
+auto t2 = thread(thread2, std::ref(e));
+is->erase(2);
+t1.join();
+t2.join();
+```
+
+结果可能跟最初的意图不太一样：
+
+```text
+1101111111
+0 1 3 4 5 6 7 8 9
+```
+
+### 与mutex相关的接口设计
+
+假设有一个stack，它的所有操作(push,top,pop等)都使用了mutex进行保护，但是下面的代码在并发的情况下依然会出现错误：
+
+```c++
+stack<int> s;
+if (! s.empty()){
+	int const value = s.top(); 
+	s.pop();
+	do_something(value);
+}
+```
+
+在调用`empty()`和`top()`之间，或者调用`top()`与`pop()`之间，可能有来自另一个线程的`pop()`调用并删除了最后一个元素。这是接口设计造成的条件竞争(race condition)。
+
+之所以将`top()`和`pop()`分为两部分(好像java就是合成一个函数的)，是为了防止在top发生异常时，保证数据没有丢失。但这造成了条件竞争。
+
+解决这个问题的方案就是将`top()`和`pop()`合成一个函数，在pop之前就将数据传递出去(参数引用或指针返回)，这时就算发生异常也不会造成数据丢失：
+
+```c++
+// 一个线程安全的栈的简单设计
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <stack>
+
+struct empty_stack : std::exception
+{
+	// 老版本使用throw()代替noexcept
+	const char* what() const noexcept {
+		return "empty stack!";
+	};
+};
+
+template<typename T>
+class threadsafe_stack
+{
+private:
+	std::stack<T> data;
+	mutable std::mutex m;
+
+public:
+	threadsafe_stack()
+		: data(std::stack<T>()) {}
+
+	threadsafe_stack(const threadsafe_stack& other)
+	{
+		std::lock_guard<std::mutex> lock(other.m);
+		data = other.data; // 在构造函数体中执行拷贝，而非成员初始化
+	}
+
+	// 栈不能直接赋值
+	threadsafe_stack& operator=(const threadsafe_stack&) = delete;
+
+	void push(T new_value)
+	{
+		std::lock_guard<std::mutex> lock(m);
+		data.push(new_value);
+	}
+	
+	void pop(T& value)
+	{
+		std::lock_guard<std::mutex> lock(m);
+		if (data.empty()) throw empty_stack(); // 在调用pop前，检查栈是否为空
+
+		value = data.top(); // 就算T的拷贝或移动赋值运算符发生异常，数据也不会丢失
+		data.pop();
+	}
+
+	// 不返回值是为了防止T的拷贝或移动构造函数发生异常
+	// 如果T的拷贝或移动构造函数都是noexcept的，那么可以返回值
+	// 返回shared_ptr是为了方便内存管理
+	std::shared_ptr<T> pop()
+	{
+		std::lock_guard<std::mutex> lock(m);
+		if (data.empty()) throw empty_stack();
+
+		std::shared_ptr<T> const res(std::make_shared<T>(data.top())); 
+		data.pop();
+		return res;
+	}	
+
+	bool empty() const
+	{
+		std::lock_guard<std::mutex> lock(m);
+		return data.empty();
+	}
+};
+```
+
+**互斥量保护的粒度不能太小，那样保护不完全；也不能太大，那样会降低性能**。
