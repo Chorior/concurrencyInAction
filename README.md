@@ -632,4 +632,474 @@ public:
 };
 ```
 
-**互斥量保护的粒度不能太小，那样保护不完全；也不能太大，那样会降低性能**。
+**互斥量保护的粒度不能太小，那样保护不完全；也不能太大，那样会降低性能；对于非共享数据的操作，就不需要互斥量保护；但是要确保一个操作的结果是正确的**。
+
+粒度：通过一个锁保护着的数据量大小。
+
+<h3 id="dead_lock">死锁</h3>
+
+**死锁(deadlock)：两个线程相互等待，导致两个线程都无法正常工作**。
+
+**如果一个操作需要锁住两个或更多互斥量，那么可能会造成死锁**。
+
+避免死锁的一般方法是：**让互斥量总是以相同的顺序上锁**。**标准库函数`std::lock(mutexs)`可以一次性锁住两个或更多互斥量，且不会有死锁的危险**，所以**如果一个操作确实需要两个或更多互斥量，那么使用`std::lock(mutexs)`**。
+
+```c++
+// std::lock(mutexs) 示例
+class some_big_object;
+void swap(some_big_object& lhs, some_big_object& rhs);
+class X
+{
+private:
+	some_big_object some_detail;
+	std::mutex m;
+public:
+	X(some_big_object const& sd) :some_detail(sd) {}
+
+	friend void swap(X& lhs, X& rhs)
+	{
+		// 同一线程如果已经对一个mutex进行lock操作
+		// 再次对其进行lock操作会引发未定义行为
+		// 但std::recursive_mutex提供这样的操作
+		if (&lhs == &rhs)
+			return;
+
+		// 当std::lock成功获取了一个互斥量上的锁，并且尝试从另一个互斥量上再获取锁时抛出了异常时
+		// 第一个锁也会随着异常的产生而自动释放，所以std::lock要么将两个锁都锁住，要不一个都不锁
+		// 使用std::lock需要参数能够提供lock(),unlock(),try_lock()成员函数
+		std::lock(lhs.m, rhs.m);
+
+		// 参数std::adopt_lock告诉std::lock_guard对象，互斥量已经被锁住了
+		// 只需接收已存在的互斥量的锁定的所有权即可，不要试图构造时锁住它们
+		std::lock_guard<std::mutex> lock_a(lhs.m, std::adopt_lock);
+		std::lock_guard<std::mutex> lock_b(rhs.m, std::adopt_lock);
+
+		// 如果非函数模板与函数模板提供同样好的匹配，则选择非模板版本
+		using std::swap; 
+		swap(lhs.some_detail, rhs.some_detail);
+	}
+};
+```
+
+### 避免死锁的进阶指导
+
+死锁不仅存在于有锁的情况，当两个线程调用join相互等待时也能发生死锁。
+
+```c++
+// 一个无锁死锁示例
+void t2();
+void t1() {
+	auto t = std::thread(t2);
+	t.join();
+}
+void t2() {
+	auto t = std::thread(t1);
+	t.join();
+}
+```
+
+*	**尽量不要使用嵌套锁**，因为这是造成死锁最常见的原因；如果一定要的话，使用`std::lock(mutexs)`；
+*	**尽量不要在持有锁的情况下调用用户代码**，因为用户代码可能会获取锁，这样会造成嵌套锁；
+*	如果确实不能使用`std::lock(mutexs)`，那么最好在每个线程上**使用固定的顺序获取锁**。典型的如一个线程正在倒序访问双向链表，而另一个正在顺序访问，那么在中间部分就可能发生死锁；如果只能按顺序访问，那就不会出现死锁；
+*	**使用锁的层次结构**。只能对比当前层次低(不包括等于)的互斥量上锁，这保证了锁的顺序性，且同一层不可能在同一时间持有两个锁，所以层级结构的互斥量是不可能产生死锁的。
+
+由于标准库并没有定义层次锁，所以需要自己定义`hierarchical_mutex`，为使其能够使用`std::lock_guard`模板，我们查看`std::lock_guard`的公有成员：
+
+```c++
+template<class _Mutex>
+	class lock_guard<_Mutex>
+	{	// specialization for a single mutex
+public:
+	typedef _Mutex mutex_type;
+
+	explicit lock_guard(_Mutex& _Mtx)
+		: _MyMutex(_Mtx)
+		{	// construct and lock
+		_MyMutex.lock();
+		}
+
+	lock_guard(_Mutex& _Mtx, adopt_lock_t)
+		: _MyMutex(_Mtx)
+		{	// construct but don't lock
+		}
+
+	~lock_guard() _NOEXCEPT
+		{	// unlock
+		_MyMutex.unlock();
+		}
+
+	lock_guard(const lock_guard&) = delete;
+	lock_guard& operator=(const lock_guard&) = delete;
+```
+
+发现**要想使用`std::lock_guard`模板，必须为模板参数提供`lock()`和`unlock()`成员，貌似并没有书中提到的`try_lock()`成员**，下面是一个简单的层次锁实现：
+
+```c++
+// 一个简单的层次锁实现
+class hierarchical_mutex
+{
+	std::mutex internal_mutex;
+
+	// 当前锁的层级值
+	unsigned long const hierarchy_value;
+
+	// 前一个锁的层级值，用以解锁后恢复原状态
+	unsigned long previous_hierarchy_value;
+
+	// 当前线程的层级值
+	// thread_local 使得每个线程都有其独立的实例
+	static thread_local unsigned long this_thread_hierarchy_value;
+
+	void check_for_hierarchy_violation()
+	{
+		// 只能使用小于当前层级值的hierarchical_mutex
+		if (this_thread_hierarchy_value <= hierarchy_value)
+		{
+			throw std::logic_error("mutex hierarchy violated");
+		}
+	}
+
+	void update_hierarchy_value()
+	{
+		previous_hierarchy_value = this_thread_hierarchy_value;
+		this_thread_hierarchy_value = hierarchy_value;
+	}
+
+public:
+	explicit hierarchical_mutex(unsigned long value) :
+		hierarchy_value(value),
+		previous_hierarchy_value(0)
+	{}
+
+	// 不需要拷贝操作和默认构造函数
+	hierarchical_mutex() = delete;
+	~hierarchical_mutex() = default;
+	hierarchical_mutex(const hierarchical_mutex&) = delete;
+	hierarchical_mutex& operator=(const hierarchical_mutex&) = delete;
+
+	void lock()
+	{
+		check_for_hierarchy_violation();
+		internal_mutex.lock();
+		update_hierarchy_value();
+	}
+
+	void unlock()
+	{
+		this_thread_hierarchy_value = previous_hierarchy_value;
+		internal_mutex.unlock();
+	}
+
+	bool try_lock()
+	{
+		check_for_hierarchy_violation();
+		// try_lock: 尝试lock互斥量，并立即返回，成功lock返回true
+		// 如果另一个线程已经对该锁进行了lock，那么返回false
+		// 如果该线程已经持有该互斥量，则调用try_lock行为未定义
+		if (!internal_mutex.try_lock())
+			return false;
+		update_hierarchy_value();
+		return true;
+	}
+};
+// 初始化为最大值是为了一开始任何层次锁都能被lock
+thread_local unsigned long
+hierarchical_mutex::this_thread_hierarchy_value(ULONG_MAX);
+```
+
+```c++
+// hierarchical_mutex的简单使用
+hierarchical_mutex high_level_mutex(10000);
+hierarchical_mutex low_level_mutex(5000);
+
+int do_low_level_stuff();
+
+int low_level_func()
+{
+	std::lock_guard<hierarchical_mutex> lk(low_level_mutex);
+	return do_low_level_stuff();
+}
+
+void high_level_stuff(int some_param);
+
+void high_level_func()
+{
+	std::lock_guard<hierarchical_mutex> lk(high_level_mutex);
+	high_level_stuff(low_level_func());
+}
+
+// 正确，层次锁从高到低进行上锁
+void thread_a()
+{
+	high_level_func();
+}
+
+hierarchical_mutex other_mutex(100);
+void do_other_stuff();
+
+void other_stuff()
+{
+	high_level_func();
+	do_other_stuff();
+}
+
+// 异常！已lock的other_mutex的层次值比high_level_mutex低
+void thread_b()
+{
+	std::lock_guard<hierarchical_mutex> lk(other_mutex);	
+	other_stuff();
+}
+```
+
+### `std::unique_lock`
+
+`std::unique_lock`比`std::lock_guard`更加灵活，查看几个常见的`std::unique_lock`公有成员：
+
+```c++
+// 默认构造函数，不持有mutex
+unique_lock() _NOEXCEPT
+	: _Pmtx(0), _Owns(false)
+	{	// default construct
+	}
+// 成功lock后，持有该mutex
+explicit unique_lock(_Mutex& _Mtx)
+	: _Pmtx(&_Mtx), _Owns(false)
+	{	// construct and lock
+	_Pmtx->lock();
+	_Owns = true;
+	}
+// 当第二个参数是std::adopt_lock时，_Mtx已经lock，并持有(own)该_Mtx
+unique_lock(_Mutex& _Mtx, adopt_lock_t)
+	: _Pmtx(&_Mtx), _Owns(true)
+	{	// construct and assume already locked
+	}
+// 当第二个参数是std::defer_lock时，_Mtx是unlock状态，但不持有(own)该_Mtx
+unique_lock(_Mutex& _Mtx, defer_lock_t) _NOEXCEPT
+	: _Pmtx(&_Mtx), _Owns(false)
+	{	// construct but don't lock
+	}
+// 当第二个参数是std::try_to_lock时，尝试lock该mutex，持有(own)与否取决于try_lock
+unique_lock(_Mutex& _Mtx, try_to_lock_t)
+	: _Pmtx(&_Mtx), _Owns(_Pmtx->try_lock())
+	{	// construct and try to lock
+	}
+// 移动构造函数
+unique_lock(unique_lock&& _Other) _NOEXCEPT
+	: _Pmtx(_Other._Pmtx), _Owns(_Other._Owns)
+	{	// destructive copy
+	_Other._Pmtx = 0;
+	_Other._Owns = false;
+	}
+// 移动赋值运算符
+unique_lock& operator=(unique_lock&& _Other)
+	{	// destructive copy
+	if (this != &_Other)
+		{	// different, move contents
+		if (_Owns)
+			_Pmtx->unlock();
+		_Pmtx = _Other._Pmtx;
+		_Owns = _Other._Owns;
+		_Other._Pmtx = 0;
+		_Other._Owns = false;
+		}
+	return (*this);
+	}
+// 析构函数
+~unique_lock() _NOEXCEPT
+	{	// clean up
+	if (_Owns)
+		_Pmtx->unlock();
+	}
+// 拷贝操作不需要
+unique_lock(const unique_lock&) = delete;
+unique_lock& operator=(const unique_lock&) = delete;
+
+void lock()
+	{	// lock the mutex
+	_Validate();
+	_Pmtx->lock();
+	_Owns = true;
+	}
+
+bool try_lock()
+	{	// try to lock the mutex
+	_Validate();
+	_Owns = _Pmtx->try_lock();
+	return (_Owns);
+	}
+
+void unlock()
+	{	// try to unlock the mutex
+	if (!_Pmtx || !_Owns)
+		_THROW_NCEE(system_error,
+			_STD make_error_code(errc::operation_not_permitted));
+
+	_Pmtx->unlock();
+	_Owns = false;
+	}
+
+void swap(unique_lock& _Other) _NOEXCEPT
+	{	// swap with _Other
+	_STD swap(_Pmtx, _Other._Pmtx);
+	_STD swap(_Owns, _Other._Owns);
+	}
+
+_Mutex *release() _NOEXCEPT
+	{	// disconnect
+	_Mutex *_Res = _Pmtx;
+	_Pmtx = 0;
+	_Owns = false;
+	return (_Res);
+	}
+
+bool owns_lock() const _NOEXCEPT
+	{	// return true if this object owns the lock
+	return (_Owns);
+	}
+// 类型转换运算符
+explicit operator bool() const _NOEXCEPT
+	{	// return true if this object owns the lock
+	return (_Owns);
+	}
+```
+
+为了对`std::unique_lock`进行示例，修改[使用std::lock(mutex)的程序](#dead_lock)如下：
+
+```c++
+// 相比而言，std::unique_lock会占用比较多的空间，并且比std::lock_guard稍慢一些
+class some_big_object;
+void swap(some_big_object& lhs, some_big_object& rhs);
+class X
+{
+private:
+	some_big_object some_detail;
+	std::mutex m;
+public:
+	X(some_big_object const& sd) :some_detail(sd) {}
+	friend void swap(X& lhs, X& rhs)
+	{
+		if (&lhs == &rhs)
+			return;
+
+		// 获取mutex，保持unlock状态，但不持有(own)它
+		std::unique_lock<std::mutex> lock_a(lhs.m, std::defer_lock);
+		std::unique_lock<std::mutex> lock_b(rhs.m, std::defer_lock);
+
+		// 对获取的mutex进行lock，并持有(own)它
+		// lock_a.lock();
+		// lock_b.lock();
+
+		// 因为unique_lock能够提供lock(),unlock(),try_lock()成员函数
+		// 所以能够使用std::lock
+		std::lock(lock_a, lock_b);
+
+		// 使用自定义函数进行数据交换
+		using std::swap;
+		swap(lhs.some_detail, rhs.some_detail);
+	}
+};
+```
+
+### 保护共享数据的初始化过程
+
+如果数据初始化后锁住一个互斥量，纯粹是为了保护其初始化过程，那么这是没有必要的，并且这会给性能带来不必要的冲击。出于以上的原因，C++标准提供了一种纯粹保护共享数据初始化过程的机制。
+
+很多单线程代码有类似下面的代码块，该代码块称为延迟初始化(Lazy initialization)：
+
+```c++
+std::shared_ptr<some_resource> resource_ptr;
+void foo()
+{
+  if(!resource_ptr)
+  {
+	// reset: 释放原有指针，并获取新指针
+    resource_ptr.reset(new some_resource);
+  }
+  resource_ptr->do_something();
+}
+```
+
+这种代码转到多线程时，可能会变成：
+
+```c++
+std::shared_ptr<some_resource> resource_ptr;
+std::mutex resource_mutex;
+
+void foo()
+{
+	// 所有线程在此序列化，这是没必要的
+	std::unique_lock<std::mutex> lk(resource_mutex);
+	if (!resource_ptr)
+	{
+		// 只有初始化过程需要保护
+		resource_ptr.reset(new some_resource);
+	}
+	lk.unlock();
+	resource_ptr->do_something();
+}
+```
+
+解决方案是使用C++标准库`std::once_flag`结构体和`std::call_once`模板：
+
+```c++
+std::shared_ptr<some_resource> resource_ptr;
+std::once_flag resource_flag; // 和mutex一样，不可复制，也不可移动，只能默认初始化
+
+void init_resource()
+{
+	resource_ptr.reset(new some_resource);
+}
+
+void foo()
+{
+	// 使用std::call_once比显式使用互斥量消耗更少资源(特别是当初始化完成后)
+	// std::call_once可以和任何可调用对象一起使用
+	std::call_once(resource_flag, init_resource);
+	resource_ptr->do_something();
+}
+```
+
+静态局部变量的初始化过程在多线程中可能会出现条件竞争，但C++11解决了这个问题：**初始化及定义完全在一个线程中发生，并且没有其他线程可在初始化完成前对其进行处理，条件竞争终止于哪个线程来做这个初始化**。
+
+```c++
+class my_class;
+
+// 多线程可以安全的调用get_my_class_instance()
+my_class& get_my_class_instance()
+{
+	static my_class instance;  // 线程安全的初始化过程
+	return instance;
+}
+```
+
+**如果数据很长时间才更新一次的话，使用mutex会降低性能**，因为大部分情况下都只是读取数据而非修改数据，这时**可以使用`boost::shared_mutex`来优化同步性能**。当数据进行更新操作时,可以使用`std::lock_guard<boost::shared_mutex>`和`std::unique_lock<boost::shared_mutex>`进行锁定,这能保证单独访问。这样做的唯一限制是：当一个线程尝试获取独占锁时，它需要等待其它拥有共享锁的线程解锁；当一个线程拥有独占锁时，其它线程不能获取独占锁或共享锁。
+
+```c++
+// 一个使用boost::shared_mutex的示例
+#include <map>
+#include <string>
+#include <mutex>
+#include <boost/thread/shared_mutex.hpp>
+class dns_entry;
+class dns_cache
+{
+	std::map<std::string, dns_entry> entries;
+	mutable boost::shared_mutex entry_mutex;
+
+public:
+	dns_entry find_entry(std::string const& domain) const
+	{
+		boost::shared_lock<boost::shared_mutex> lk(entry_mutex);
+		std::map<std::string, dns_entry>::const_iterator const it =
+			entries.find(domain);
+		return (it == entries.end()) ? dns_entry() : it->second;
+	}
+
+	void update_or_add_entry(std::string const& domain,
+		dns_entry const& dns_details)
+	{
+		std::lock_guard<boost::shared_mutex> lk(entry_mutex);
+		entries[domain] = dns_details;
+	}
+};
+```
