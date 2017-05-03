@@ -16,6 +16,7 @@ tags:
 *   [多线程管理](#managing_threads)
 *   [多线程识别](#thread_identification)
 *   [线程间共享数据](#sharing_data_between_threads)
+*   [多线程同步](#synchronizing_thread)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
@@ -665,7 +666,7 @@ public:
 			return;
 
 		// 当std::lock成功获取了一个互斥量上的锁，并且尝试从另一个互斥量上再获取锁时抛出了异常时
-		// 第一个锁也会随着异常的产生而自动释放，所以std::lock要么将两个锁都锁住，要不一个都不锁
+		// 第一个锁也会随着异常的产生而自动释放，所以std::lock要么将两个锁都锁住，要么一个都不锁
 		// 使用std::lock需要参数能够提供lock(),unlock(),try_lock()成员函数
 		std::lock(lhs.m, rhs.m);
 
@@ -1103,3 +1104,294 @@ public:
 	}
 };
 ```
+
+<h2 id="synchronizing_thread">多线程同步</h2>
+
+在一个线程完成之前，可能需要等待另一个线程执行完成(如双目摄像头的图像获取显示)，这种情况就需要线程同步。C++标准库提供条件变量(condition variables)和期望(futures)来处理线程同步问题。
+
+当一个线程等待另一个线程完成任务时，可以有很多种方法：
+
+*	持续检查共享数据标志(被mutex保护着)，直到另一线程完成工作时对这个标志进行重设。但这样会消耗不必要的时间检查，并且其它需要该mutex的线程会处于等待状态，消耗系统资源。
+*	在等待完成期间,使用`std::this_thread::sleep_for()`函数进行周期性的间歇。这样线程没有浪费执行时间，但是很难确定正确的休眠时间。
+*	**(最佳选择)使用C++标准库提供的工具去等待事件发生**。等待一个事件被另一个线程触发最基本的工具是使用条件变量(condition variables)；从概念上讲，一个条件变量与多个事件或其它条件相关联，并且一个或更多线程会等待那个条件的达成；当某些线程确定那个条件达成时，它会通知一个或多个在条件变量上等待的线程，继而唤醒它们，继续工作。
+
+```c++
+// 周期间歇
+bool flag;
+std::mutex m;
+void wait_for_flag()
+{
+	std::unique_lock<std::mutex> lk(m);
+	while(!flag)
+	{
+		lk.unlock();
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		lk.lock();
+	}
+}
+```
+
+### 条件变量(condition variables)
+
+标准库提供两种条件变量的实现(`<condition_variable>`)：
+
+*	`std::condition_variable`
+*	`td::condition_variable_any`
+
+为了进行合适的同步，它们都需要与一个mutex一起工作。但是`std::condition_variable`只能与`std::mutex`一起使用，而`td::condition_variable_any`可以和任何满足最低标准的互斥量一起工作，但是会有一些额外的开销。**一般情况下，首选`std::condition_variable`，当对灵活性有需求时，才会使用`td::condition_variable_any`**。
+
+```c++
+// condition_variable的简单使用
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <string>
+#include <queue>
+#include <condition_variable>
+
+// 共享队列
+std::queue<std::string> data_queue;
+
+// 锁住共享队列，并且与condition_variable相关联
+std::mutex mut; 
+std::condition_variable data_cond;
+
+// 将每次输入打印在屏幕上，由于只有一个线程在使用std::cout，所以无需上锁
+void process(const std::string& str){ std::cout << str << "\n"; }
+
+// 当输入字符串为quit时，结束线程
+bool is_last_chunk(const std::string& str){ return str == "quit"; }
+
+void data_preparation_thread(){
+	std::string str;
+	// 这里只有一个线程在使用std::cin，不用上锁
+	while(std::cin >> str){		
+		// 在执行共享队列的修改操作时，需要上锁
+		std::lock_guard<std::mutex> lk(mut);
+		data_queue.push(str);
+
+		// 通知等待data_cond的线程，条件达成
+		data_cond.notify_one();
+		if(is_last_chunk(str)) break;
+	}
+}
+
+void data_processing_thread(){
+	while(true){
+		// 在等待条件变量时及数据弹出队列后，不需要对mut进行lock
+		// 所以使用std::unique_lock对mut进行灵活的控制
+		std::unique_lock<std::mutex> lk(mut);
+		// wait(unique_lock<mutex>&, _Predicate): 接受一个unique_lock实例和一个bool型可调用对象(断言)
+		// 如果断言返回true，则wait立即返回，如果断言返回false，则wait()会解锁传递的互斥量,并使线程阻塞
+		// 当成员函数notify_one()成员函数被调用时，调用wait()的其中一个线程醒来，重新获取锁，并再次检查断言，如未返回true，则继续解锁等待
+		// 当成员函数notify_all()成员函数被调用时，调用wait()的所有线程醒来，重新获取锁，并再次检查断言，如未返回true，则继续解锁等待
+		data_cond.wait(
+			lk,[]{return !data_queue.empty();});
+
+		// 弹出数据
+		auto data = data_queue.front();
+		data_queue.pop();
+		lk.unlock(); 
+
+		// 对弹出的数据进行操作
+		process(data);
+		if(is_last_chunk(data)) break;
+	}
+}
+
+int main()
+{
+	std::thread t1(data_preparation_thread);
+	std::thread t2(data_processing_thread);
+
+	t1.join();
+	t2.join();
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+结果
+
+```text
+kdjfa
+kdjfa
+quit
+quit
+
+```
+
+### 一个使用条件变量的简单线程安全队列
+
+```c++
+// 一个使用条件变量的简单线程安全队列
+#include <queue>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+
+template<typename T>
+class threadsafe_queue
+{
+private:
+	// mutable：不管函数是否有const限定符，都可以对其进行修改
+	// 由于empty()操作(const限定)需要对mut进行lock，但lock会修改mut的状态，所以标记为mutable
+	mutable std::mutex mut;
+	std::queue<T> data_queue;
+	std::condition_variable data_cond;
+public:
+	threadsafe_queue() = default;
+	~threadsafe_queue() = default;
+	// 不允许拷贝赋值操作
+	threadsafe_queue(const threadsafe_queue&) = delete;
+	threadsafe_queue& operator=(const threadsafe_queue&) = delete;
+
+	void push(T new_value)
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		data_queue.push(new_value);
+		data_cond.notify_one();
+	}
+
+	void wait_and_pop(T& value)
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk,[this]{return !data_queue.empty();});
+		value=data_queue.front();
+		data_queue.pop();
+	}
+
+	std::shared_ptr<T> wait_and_pop()
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk,[this]{return !data_queue.empty();});
+		std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
+		data_queue.pop();
+		return res;
+	}
+
+	bool try_pop(T& value)
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if(data_queue.empty())
+			return false;
+		value=data_queue.front();
+		data_queue.pop();
+		return true;
+	}
+
+	std::shared_ptr<T> try_pop()
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if(data_queue.empty())
+			return std::shared_ptr<T>();
+		std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
+		data_queue.pop();
+		return res;
+	}
+
+	bool empty() const
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		return data_queue.empty();
+	}
+};
+```
+
+### 期望(future)
+
+**C++标准库将一次性(one-off)事件称为期望(future)**。当一个线程需要等待一个特定的一次性事件时，在某种程度上来说它知道这个事件在未来的表现形式。之后，这个线程会周期性的等待事件被触发，在等待期间也可以执行其他任务。**期望的事件发生后不能被重置**。
+
+C++标准库有两种类型的futures模板实现(`<future>`)：
+
+*	`std::future<>`：独立期望(unique futures);
+*	`std::shared_future<>`：共享期望(shared futures)。
+
+一个`std::future`的实例是它关联事件的唯一实例；而多个`std::shared_future`实例却可以同时关联到同一个事件，这种情况下，所有实例会在同一时间变为ready状态，它们可以访问与事件相关的任何数据;
+
+模板参数是关联数据的类型，void表示事件无关联数据。
+
+**期望类不提供同步访问**，如果多个线程需要访问同一个期望实例，那么它们需要通过[线程间共享数据](#sharing_data_between_threads)来保护访问。
+
+最基本的一次性(one-off)事件是有返回值的后台线程，但是因为`std::thread`并不提供直接接收返回值的机制，所以这里就需要`std::async`函数模板(定义于`<future>`)了。
+
+```c++
+// 一个使用std::async的简单示例
+#include <iostream>
+#include <future>
+#include <string>
+
+int find_the_answer_to_ltuae(int, double&);
+void do_other_stuff();
+
+struct X
+{
+	void foo(int,std::string const&);
+	std::string bar(std::string const&);
+};
+
+struct Y
+{
+	double operator()(double);
+};
+
+class move_only
+{
+public:
+	move_only();
+	move_only(move_only&&);
+	move_only(move_only const&) = delete;
+	move_only& operator=(move_only&&);
+	move_only& operator=(move_only const&) = delete;
+	void operator()();
+};
+
+int main()
+{
+	// std::async启动一个不需要立即获取结果的异步任务，参数传入与std::thread一样
+	// 并返回一个std::future对象，这个对象最后持有函数的返回值
+	// 对返回的future对象调用get()，线程阻塞直到future状态变为ready，然后返回结果
+	int a = 2;
+	double b = 3;
+	std::future<int> the_answer = std::async(find_the_answer_to_ltuae,a,std::ref(b));
+	do_other_stuff();
+	std::cout<<"The answer is "<<the_answer.get()<<std::endl;
+	
+	X x;
+	auto f1 = std::async(&X::foo,&x,42,"hello");// Calls p->foo(42,"hello") where p is &x
+	auto f2 = std::async(&X::bar,x,"goodbye");  // Calls tmpx.bar("goodbye") where tmpx is a copy of x
+	
+	Y y;
+	auto f3=std::async(Y(),3.141);              // Calls tmpy(3.141) where tmpy is move-constructed from Y()
+	auto f4=std::async(std::ref(y),2.718);      // Calls y(2.718)
+
+	X baz(X&);                                  // function declaration
+	std::async(baz,std::ref(x));                // Calls baz(x)
+	
+	auto f5=std::async(move_only());            // Calls tmp() where tmp is constructed from std::move(move_only())
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+你可以在调用`std::async`前传入一些额外的参数：
+
+*	`std::launch::deferred`：函数调用延迟直到成员函数`wait()`或`get()`被调用；
+*	`std::launch::async`：函数必须在其自己的线程上运行；
+*	`std::launch::deferred | std::launch::async`：默认参数，编译器自己选择。
+
+```c++
+// std::async额外参数的简单示例
+auto f6=std::async(std::launch::async,Y(),1.2);            // Run in new thread
+auto f7=std::async(std::launch::deferred,baz,std::ref(x)); // Run in wait() or get()
+auto f8=std::async(
+	std::launch::deferred | std::launch::async,
+	baz,std::ref(x));                                      // Implementation chooses
+auto f9=std::async(baz,std::ref(x));                       // Implementation chooses
+f7.wait();                                                 // Invoke deferred function
+```
+
+
