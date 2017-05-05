@@ -1394,4 +1394,34 @@ auto f9=std::async(baz,std::ref(x));                       // Implementation cho
 f7.wait();                                                 // Invoke deferred function
 ```
 
+**`std::async`使得算法可以被轻松的分成多个任务，然后同步执行**，但这不是任务关联到`std::future`的唯一方法。你还可以使用类模板`std::packaged_task`和`std::promise`。
 
+### std::packaged_task
+
+`std::packaged_task`绑定一个future`到可调用对象。当`std::packaged_task`被唤醒时，它调用关联的可调用对象，使future变为ready状态，并存储返回值到这个future。
+
+`std::packaged_task`的模板参数是一个函数签名，void表示无返回值无参数函数，`int(std::string&,double*)`代表返回值为int，参数类型为`string &,double *`。
+
+构造`std::packaged_task`实例时，必须传入一个函数或可调用对象，这个函数或可调用对象需要能接收指定的参数和返回可转换为指定返回类型的值。
+
+```c++
+// 一个std::packaged_task特例化版本的局部定义
+template<>
+class packaged_task<std::string(std::vector<char>*,int)>
+{
+public:
+	// 模板构造函数
+	template<typename Callable>
+	explicit packaged_task(Callable&& f);
+	
+	// 函数签名返回类型指定get_future的返回类型
+	std::future<std::string> get_future();
+	
+	// 函数签名参数类型指定调用运算符的参数类型
+	void operator()(std::vector<char>*,int);
+};
+```
+
+### std::promise
+
+`std::promise<T>`提供一种设置值(类型为T)的方法，这个值可以在设置之后被关联的`std::future<T>`对象读取。可以通过调用成员函数`get_future()`获取`std::promise<T>`关联的future。当promise通过成员函数`set_value()`设置完值后，关联的future状态变为ready，并且通过其可以获取存储的值。如果promise没有设置值就被销毁了，那么异常会被存储在future中。
