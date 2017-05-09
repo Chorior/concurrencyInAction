@@ -13,14 +13,35 @@ tags:
 #   本文结构
 
 *   [多线程概述](#multithreading_overview)
+	*   [基本概念](#basic_conception)
+	*   [使用并发的两种方法](#two_ways_to_use_concurrency)
+	*   [使用并发的两种原因](#two_reason_to_use_concurrency)
+	*   [并发的缺点](#weak_points_of_concurrency)
+	*   [Hello, world](#hello_world)
 *   [多线程管理](#managing_threads)
-*   [多线程识别](#thread_identification)
+	*   [std::thread](#std_thread)
+	*   [线程启动](#start_a_thread)
+	*   [异常处理](#deal_thread_exception)
+	*   [多线程识别](#thread_identification)
 *   [线程间共享数据](#sharing_data_between_threads)
+	*   [std::mutex](#std_mutex)
+	*   [与mutex相关的接口设计](#api_design_with_mutex)
+	*   [死锁](#dead_lock)
+	*   [避免死锁的进阶指导](#advanced_guide_of_dead_lock)
+	*   [std::unique_lock](#std_unique_lock)
+	*   [std::once_flag和std::call_once](#std_onceflag_and_callonce)
+	*   [boost::shared_mutex](#boost_shared_mutex)
 *   [多线程同步](#synchronizing_thread)
+	*   [条件变量(condition variables)](#condition_variable)
+	*   [期望(future)](#future)
+	*   [std::future](#std_future)
+	*   [std::packaged_task](#std_packaged_task)
+	*   [std::promise](#std_promise)
+	*   [future存储异常](#save_exception_for_future)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
-### 基本概念
+<h3 id="basic_conception">基本概念</h3>
 
 并发：**同一时间内发生两个或更多独立的活动**；
 
@@ -30,7 +51,7 @@ tags:
 
 **即便是具有真正硬件并发的系统，有时候也会需要任务切换**；
 
-### 使用并发的两种方法
+<h3 id="two_ways_to_use_concurrency">使用并发的两种方法</h3>
 
 将应用程序分为多个独立的进程,它们在同一时刻运行
 
@@ -58,7 +79,7 @@ tags:
 
 **C++标准并未对进程间通信提供任何原生支持**。
 
-### 使用并发的两种原因
+<h3 id="two_reason_to_use_concurrency">使用并发的两种原因</h3>
 
 分离关注点(separation of concerns(SOC))
 
@@ -70,7 +91,7 @@ tags:
 *   任务并行(task parallelism)：将一个单个任务分成几部分，且各自并行运行，从而降低总运行时间；
 *   数据并行(data parallelism)：同时对多组数据执行相同的操作。
 
-### 并发的缺点
+<h3 id="weak_points_of_concurrency">并发的缺点</h3>
 
 *   如果在线程上的任务完成得很快，那么任务实际执行的时间要比启动线程的时间小很多；
 *   运行太多的线程会耗尽进程的可用内存或地址空间(**可以使用线程池来限定线程数量**)；
@@ -81,7 +102,7 @@ tags:
 
 **在绝大多数情况下，额外增加的复杂性和出错几率都远大于性能的小幅提升带来的收益**。
 
-### Hello, world
+<h3 id="hello_world">Hello, world</h3>
 
 ```c++
 #include <iostream>
@@ -106,6 +127,8 @@ int main()
 *   **使用多线程并不复杂，复杂的是如何设计代码以实现其预期的行为**。
 
 <h2 id="managing_threads">多线程管理</h2>
+
+<h3 id="std_thread">std::thread</h3>
 
 **每个程序至少有一个线程：执行main()函数的线程**，其余线程有其各自的入口函数。线程与原始线程(以main()为入口函数的线程)同时运行。如同main()函数执行完会退出一样，当线程执行完入口函数后，线程也会退出。
 
@@ -219,7 +242,7 @@ public:
 
 detach线程又称守护线程(daemon threads)，**C++运行库保证，当detach线程退出时，相关资源的能够正确回收，后台线程的归属和控制C++运行库都会处理**。
 
-<h2 id="start_a_thread">线程启动</h2>
+<h3 id="start_a_thread">线程启动</h3>
 
 **使用C++线程库开启一个线程通常归结为构造一个`std::thread`类对象**。
 
@@ -314,6 +337,8 @@ mod: 1
 
 ```
 
+<h3 id="deal_thread_exception">异常处理</h3>
+
 如果在thread对象join或者detach之前，原始线程发生了异常，那么对象会使用栈的方式对对象进行销毁，这时因为thread对象还是joinable的，所以销毁thread对象会调用`terminate()`。为了避免这样的情况，程序员通常使用两种方式来解决这个问题：
 
 *   使用异常处理，try-catch；
@@ -360,7 +385,7 @@ void f()
 } 
 ```
 
-<h2 id="thread_identification">多线程识别</h2>
+<h3 id="thread_identification">多线程识别</h3>
 
 线程标识类型是`std::thread::id`，这个值可以通过两种方式进行检索：
 
@@ -428,13 +453,13 @@ template<>
 
 <h2 id="sharing_data_between_threads">线程间共享数据</h2>
 
-条件竞争(race condition)：当一个线程A正在修改共享数据时，另一个线程B却在使用这个共享数据，这时B访问到的数据可能不是正确的数据，这种情况称为条件竞争。
+**条件竞争(race condition)：当一个线程A正在修改共享数据时，另一个线程B却在使用这个共享数据，这时B访问到的数据可能不是正确的数据，这种情况称为条件竞争**。
 
-数据竞争(data race)：一种特殊的条件竞争；并发的去修改一个独立对象。
+**数据竞争(data race)：一种特殊的条件竞争；并发的去修改一个独立对象**。
 
 多线程的一个关键优点(key benefit)是可以简单的直接共享数据，但如果有多个线程拥有修改共享数据的权限，那么就会很容易出现数据竞争(data race)。
 
-### 使用mutex
+<h3 id="std_mutex">std::mutex</h3>
 
 **C++标准保护共享数据最基本的技巧是使用互斥量(mutex)**：当访问共享数据前，使用互斥量将相关数据锁住，再当访问结束后，再将数据解锁。线程库需要保证，当一个线程使用特定互斥量锁住共享数据时，其他的线程想要访问锁住的数据，都必须等到之前那个线程对数据进行解锁后，才能进行访问。
 
@@ -443,7 +468,7 @@ template<>
 *	创建互斥量：建造一个`std::mutex`的实例；
 *	锁住互斥量：调用成员函数`lock()`；
 *	释放互斥量：调用成员函数`unlock()`；
-*	由于`lock()`与`unlock()`必须配对，就像new和delete一样，所以为了方便和异常处理，C++标准库也专门提供了一个模板类`std::lock_guard`，其在构造时lock互斥量,析构时unlock互斥量。
+*	由于`lock()`与`unlock()`必须配对，就像new和delete一样，所以为了方便和异常处理，**C++标准库也专门提供了一个模板类`std::lock_guard`**，其在构造时lock互斥量,析构时unlock互斥量。
 
 `std::mutex`和`std::lock_guard`定义于头文件`<mutex>`中。
 
@@ -543,7 +568,7 @@ t2.join();
 0 1 3 4 5 6 7 8 9
 ```
 
-### 与mutex相关的接口设计
+<h3 id="api_design_with_mutex">与mutex相关的接口设计</h3>
 
 假设有一个stack，它的所有操作(push,top,pop等)都使用了mutex进行保护，但是下面的代码在并发的情况下依然会出现错误：
 
@@ -591,7 +616,7 @@ public:
 	threadsafe_stack(const threadsafe_stack& other)
 	{
 		std::lock_guard<std::mutex> lock(other.m);
-		data = other.data; // 在构造函数体中执行拷贝，而非成员初始化
+		data = other.data; // 在构造函数体中执行拷贝，而非成员初始化，这样安全
 	}
 
 	// 栈不能直接赋值
@@ -682,12 +707,12 @@ public:
 };
 ```
 
-### 避免死锁的进阶指导
+<h3 id="advanced_guide_of_dead_lock">避免死锁的进阶指导</h3>
 
 死锁不仅存在于有锁的情况，当两个线程调用join相互等待时也能发生死锁。
 
 ```c++
-// 一个无锁死锁示例
+// 一个无mutex的死锁示例
 void t2();
 void t1() {
 	auto t = std::thread(t2);
@@ -852,7 +877,7 @@ void thread_b()
 }
 ```
 
-### `std::unique_lock`
+<h3 id="std_unique_lock">std::unique_lock</h3>
 
 `std::unique_lock`比`std::lock_guard`更加灵活，查看几个常见的`std::unique_lock`公有成员：
 
@@ -1001,7 +1026,7 @@ public:
 };
 ```
 
-### 保护共享数据的初始化过程
+<h3 id="std_onceflag_and_callonce">std::once_flag和std::call_once</h3>
 
 如果数据初始化后锁住一个互斥量，纯粹是为了保护其初始化过程，那么这是没有必要的，并且这会给性能带来不必要的冲击。出于以上的原因，C++标准提供了一种纯粹保护共享数据初始化过程的机制。
 
@@ -1073,6 +1098,8 @@ my_class& get_my_class_instance()
 }
 ```
 
+<h3 id="boost_shared_mutex">boost::shared_mutex</h3>
+
 **如果数据很长时间才更新一次的话，使用mutex会降低性能**，因为大部分情况下都只是读取数据而非修改数据，这时**可以使用`boost::shared_mutex`来优化同步性能**。当数据进行更新操作时,可以使用`std::lock_guard<boost::shared_mutex>`和`std::unique_lock<boost::shared_mutex>`进行锁定,这能保证单独访问。这样做的唯一限制是：当一个线程尝试获取独占锁时，它需要等待其它拥有共享锁的线程解锁；当一个线程拥有独占锁时，其它线程不能获取独占锁或共享锁。
 
 ```c++
@@ -1131,7 +1158,7 @@ void wait_for_flag()
 }
 ```
 
-### 条件变量(condition variables)
+<h3 id="condition_variable">条件变量(condition variables)</h3>
 
 标准库提供两种条件变量的实现(`<condition_variable>`)：
 
@@ -1154,31 +1181,31 @@ void wait_for_flag()
 std::queue<std::string> data_queue;
 
 // 锁住共享队列，并且与condition_variable相关联
-std::mutex mut; 
+std::mutex mut;
 std::condition_variable data_cond;
 
 // 将每次输入打印在屏幕上，由于只有一个线程在使用std::cout，所以无需上锁
-void process(const std::string& str){ std::cout << str << "\n"; }
+void process(const std::string& str) { std::cout << str << "\n"; }
 
 // 当输入字符串为quit时，结束线程
-bool is_last_chunk(const std::string& str){ return str == "quit"; }
+bool is_last_chunk(const std::string& str) { return str == "quit"; }
 
-void data_preparation_thread(){
+void data_preparation_thread() {
 	std::string str;
 	// 这里只有一个线程在使用std::cin，不用上锁
-	while(std::cin >> str){		
+	while (std::cin >> str) {
 		// 在执行共享队列的修改操作时，需要上锁
 		std::lock_guard<std::mutex> lk(mut);
 		data_queue.push(str);
 
 		// 通知等待data_cond的线程，条件达成
 		data_cond.notify_one();
-		if(is_last_chunk(str)) break;
+		if (is_last_chunk(str)) break;
 	}
 }
 
-void data_processing_thread(){
-	while(true){
+void data_processing_thread() {
+	while (true) {
 		// 在等待条件变量时及数据弹出队列后，不需要对mut进行lock
 		// 所以使用std::unique_lock对mut进行灵活的控制
 		std::unique_lock<std::mutex> lk(mut);
@@ -1187,16 +1214,16 @@ void data_processing_thread(){
 		// 当成员函数notify_one()成员函数被调用时，调用wait()的其中一个线程醒来，重新获取锁，并再次检查断言，如未返回true，则继续解锁等待
 		// 当成员函数notify_all()成员函数被调用时，调用wait()的所有线程醒来，重新获取锁，并再次检查断言，如未返回true，则继续解锁等待
 		data_cond.wait(
-			lk,[]{return !data_queue.empty();});
+			lk, [] {return !data_queue.empty(); });
 
 		// 弹出数据
 		auto data = data_queue.front();
 		data_queue.pop();
-		lk.unlock(); 
+		lk.unlock();
 
 		// 对弹出的数据进行操作
 		process(data);
-		if(is_last_chunk(data)) break;
+		if (is_last_chunk(data)) break;
 	}
 }
 
@@ -1244,6 +1271,7 @@ private:
 public:
 	threadsafe_queue() = default;
 	~threadsafe_queue() = default;
+
 	// 不允许拷贝赋值操作
 	threadsafe_queue(const threadsafe_queue&) = delete;
 	threadsafe_queue& operator=(const threadsafe_queue&) = delete;
@@ -1258,15 +1286,15 @@ public:
 	void wait_and_pop(T& value)
 	{
 		std::unique_lock<std::mutex> lk(mut);
-		data_cond.wait(lk,[this]{return !data_queue.empty();});
-		value=data_queue.front();
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
+		value = data_queue.front();
 		data_queue.pop();
 	}
 
 	std::shared_ptr<T> wait_and_pop()
 	{
 		std::unique_lock<std::mutex> lk(mut);
-		data_cond.wait(lk,[this]{return !data_queue.empty();});
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
 		std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
 		data_queue.pop();
 		return res;
@@ -1275,9 +1303,9 @@ public:
 	bool try_pop(T& value)
 	{
 		std::lock_guard<std::mutex> lk(mut);
-		if(data_queue.empty())
+		if (data_queue.empty())
 			return false;
-		value=data_queue.front();
+		value = data_queue.front();
 		data_queue.pop();
 		return true;
 	}
@@ -1285,7 +1313,7 @@ public:
 	std::shared_ptr<T> try_pop()
 	{
 		std::lock_guard<std::mutex> lk(mut);
-		if(data_queue.empty())
+		if (data_queue.empty())
 			return std::shared_ptr<T>();
 		std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
 		data_queue.pop();
@@ -1300,7 +1328,7 @@ public:
 };
 ```
 
-### 期望(future)
+<h3 id="future">期望(future)</h3>
 
 **C++标准库将一次性(one-off)事件称为期望(future)**。当一个线程需要等待一个特定的一次性事件时，在某种程度上来说它知道这个事件在未来的表现形式。之后，这个线程会周期性的等待事件被触发，在等待期间也可以执行其他任务。**期望的事件发生后不能被重置**。
 
@@ -1311,11 +1339,70 @@ C++标准库有两种类型的futures模板实现(`<future>`)：
 
 一个`std::future`的实例是它关联事件的唯一实例；而多个`std::shared_future`实例却可以同时关联到同一个事件，这种情况下，所有实例会在同一时间变为ready状态，它们可以访问与事件相关的任何数据;
 
-模板参数是关联数据的类型，void表示事件无关联数据。
+<h3 id="std_future">std::future</h3>
+
+查看`std::future<>`的源代码：
+
+```c++
+// 模板参数是关联数据的类型，void表示事件无关联数据。
+template<class _Ty>
+class future<_Ty&>
+	: public _State_manager<_Ty *>
+{	// class that defines a non-copyable asynchronous return object
+	// that holds a reference
+	typedef _State_manager<_Ty *> _Mybase;
+public:
+	future() _NOEXCEPT
+	{	// construct
+	}
+
+	future(future&& _Other) _NOEXCEPT
+		: _Mybase(_STD forward<future>(_Other), true)
+	{	// construct from rvalue future object
+	}
+
+	future& operator=(future&& _Right) _NOEXCEPT
+	{	// assign from rvalue future object
+		_Mybase::operator=(_STD forward<future>(_Right));
+		return (*this);
+	}
+
+	future(const _Mybase& _State, _Nil)
+		: _Mybase(_State, true)
+	{	// construct from associated asynchronous state object
+	}
+
+	~future() _NOEXCEPT
+	{	// destroy
+	}
+
+	_Ty& get()
+	{	// block until ready then return the stored result or
+		// throw the stored exception
+		return (*this->_Get_value());
+	}
+
+	shared_future<_Ty&> share()
+	{	// return state as shared_future
+		return (shared_future<_Ty&>(_STD move(*this)));
+	}
+
+	// 拷贝操作被删除
+	future(const future&) = delete;
+	future& operator=(const future&) = delete;
+};
+```
+
+*	发现future的父类是`_State_manager`模板，`_State_manager`模板包含一些状态管理的操作；
+*	一个非常有用的函数是`get()`函数，该函数阻塞直到future状态变为ready，然后返回结果；
+*	另外几个非常有用的wait系列函数来自`_State_manager`模板：
+	*	`wait()`函数阻塞直到结果变为有效(valid)；
+	*	`wait_for(time)`如果结果在指定时间内还不可用(valid)，那么会返回timeout；
+	*	`wait_until(timepoint)`如果到达指定时间点时结果还不可用(valid)，那么会返回timeout。
 
 **期望类不提供同步访问**，如果多个线程需要访问同一个期望实例，那么它们需要通过[线程间共享数据](#sharing_data_between_threads)来保护访问。
 
-最基本的一次性(one-off)事件是有返回值的后台线程，但是因为`std::thread`并不提供直接接收返回值的机制，所以这里就需要`std::async`函数模板(定义于`<future>`)了。
+最基本的一次性(one-off)事件是有返回值的后台线程，但是`std::thread`并不提供直接接收返回值的机制，这里可以使用`std::async`函数模板(定义于`<future>`)。
 
 ```c++
 // 一个使用std::async的简单示例
@@ -1328,7 +1415,7 @@ void do_other_stuff();
 
 struct X
 {
-	void foo(int,std::string const&);
+	void foo(int, std::string const&);
 	std::string bar(std::string const&);
 };
 
@@ -1341,10 +1428,13 @@ class move_only
 {
 public:
 	move_only();
+
 	move_only(move_only&&);
-	move_only(move_only const&) = delete;
 	move_only& operator=(move_only&&);
+
+	move_only(move_only const&) = delete;
 	move_only& operator=(move_only const&) = delete;
+
 	void operator()();
 };
 
@@ -1355,22 +1445,22 @@ int main()
 	// 对返回的future对象调用get()，线程阻塞直到future状态变为ready，然后返回结果
 	int a = 2;
 	double b = 3;
-	std::future<int> the_answer = std::async(find_the_answer_to_ltuae,a,std::ref(b));
+	std::future<int> the_answer = std::async(find_the_answer_to_ltuae, a, std::ref(b));
 	do_other_stuff();
-	std::cout<<"The answer is "<<the_answer.get()<<std::endl;
-	
-	X x;
-	auto f1 = std::async(&X::foo,&x,42,"hello");// Calls p->foo(42,"hello") where p is &x
-	auto f2 = std::async(&X::bar,x,"goodbye");  // Calls tmpx.bar("goodbye") where tmpx is a copy of x
-	
-	Y y;
-	auto f3=std::async(Y(),3.141);              // Calls tmpy(3.141) where tmpy is move-constructed from Y()
-	auto f4=std::async(std::ref(y),2.718);      // Calls y(2.718)
+	std::cout << "The answer is " << the_answer.get() << std::endl;
 
-	X baz(X&);                                  // function declaration
-	std::async(baz,std::ref(x));                // Calls baz(x)
-	
-	auto f5=std::async(move_only());            // Calls tmp() where tmp is constructed from std::move(move_only())
+	X x;
+	auto f1 = std::async(&X::foo, &x, 42, "hello");// Calls p->foo(42,"hello") where p is &x
+	auto f2 = std::async(&X::bar, x, "goodbye");   // Calls tmpx.bar("goodbye") where tmpx is a copy of x
+
+	Y y;
+	auto f3 = std::async(Y(), 3.141);              // Calls tmpy(3.141) where tmpy is move-constructed from Y()
+	auto f4 = std::async(std::ref(y), 2.718);      // Calls y(2.718)
+
+	X baz(X&);                                     // function declaration
+	std::async(baz, std::ref(x));                  // Calls baz(x)
+
+	auto f5 = std::async(move_only());             // Calls tmp() where tmp is constructed from std::move(move_only())
 
 	getchar();
 	return EXIT_SUCCESS;
@@ -1384,21 +1474,20 @@ int main()
 *	`std::launch::deferred | std::launch::async`：默认参数，编译器自己选择。
 
 ```c++
-// std::async额外参数的简单示例
-auto f6=std::async(std::launch::async,Y(),1.2);            // Run in new thread
-auto f7=std::async(std::launch::deferred,baz,std::ref(x)); // Run in wait() or get()
-auto f8=std::async(
+auto f6 = std::async(std::launch::async, Y(), 1.2);            // Run in new thread
+auto f7 = std::async(std::launch::deferred, baz, std::ref(x)); // Run in wait() or get()
+auto f8 = std::async(
 	std::launch::deferred | std::launch::async,
-	baz,std::ref(x));                                      // Implementation chooses
-auto f9=std::async(baz,std::ref(x));                       // Implementation chooses
-f7.wait();                                                 // Invoke deferred function
+	baz, std::ref(x));                                         // Implementation chooses
+auto f9 = std::async(baz, std::ref(x));                        // Implementation chooses
+f7.wait();                                                     // 阻塞，直到结果有效(valid)
 ```
 
 **`std::async`使得算法可以被轻松的分成多个任务，然后同步执行**，但这不是任务关联到`std::future`的唯一方法。你还可以使用类模板`std::packaged_task`和`std::promise`。
 
-### std::packaged_task
+<h3 id="std_packaged_task">std::packaged_task</h3>
 
-`std::packaged_task`绑定一个future`到可调用对象。当`std::packaged_task`被唤醒时，它调用关联的可调用对象，使future变为ready状态，并存储返回值到这个future。
+`std::packaged_task`绑定一个future`到可调用对象。当`std::packaged_task`被调用时，它调用关联的可调用对象，使future变为ready状态，并存储返回值到这个future。
 
 `std::packaged_task`的模板参数是一个函数签名，void表示无返回值无参数函数，`int(std::string&,double*)`代表返回值为int，参数类型为`string &,double *`。
 
@@ -1407,21 +1496,286 @@ f7.wait();                                                 // Invoke deferred fu
 ```c++
 // 一个std::packaged_task特例化版本的局部定义
 template<>
-class packaged_task<std::string(std::vector<char>*,int)>
+class packaged_task<std::string(std::vector<char>*, int)>
 {
 public:
 	// 模板构造函数
 	template<typename Callable>
 	explicit packaged_task(Callable&& f);
-	
+
 	// 函数签名返回类型指定get_future的返回类型
 	std::future<std::string> get_future();
-	
+
 	// 函数签名参数类型指定调用运算符的参数类型
-	void operator()(std::vector<char>*,int);
+	void operator()(std::vector<char>*, int);
 };
 ```
 
-### std::promise
+```c++
+// 一个使用std::packaged_task的简单示例
+#include <iostream>
+#include <future>
+#include <string>
+
+void f1() { std::cout << "void f1() called." << std::endl; }
+int f2(int a) { return a; }
+std::string f3(std::string &str) { return str; }
+double f4(double a) { return a; }
+
+int main()
+{
+	std::packaged_task<void()> task1(f1);
+	std::packaged_task<int(int)> task2(f2);
+	std::packaged_task<std::string(std::string&)> task3(f3);
+	std::packaged_task<int(int)> task4(f4);
+	
+	task1();
+	task2(123);
+	std::string str("hahahaha");
+	task3(std::ref(str));
+	task4(123);
+
+	auto future1 = task1.get_future();
+	auto future2 = task2.get_future();
+	auto future3 = task3.get_future();
+	auto future4 = task4.get_future();
+
+	// wait感觉没什么软用，因为get包含了wait
+	future1.wait();
+	future2.wait();
+	future3.wait();
+	future4.wait();
+
+	std::cout << future2.get() << "\n"
+		<< future3.get() << "\n"
+		<< future4.get() << std::endl;
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果：
+
+```text
+void f1() called.
+123
+hahahaha
+123
+
+
+```
+
+<h3 id="std_promise">std::promise</h3>
 
 `std::promise<T>`提供一种设置值(类型为T)的方法，这个值可以在设置之后被关联的`std::future<T>`对象读取。可以通过调用成员函数`get_future()`获取`std::promise<T>`关联的future。当promise通过成员函数`set_value()`设置完值后，关联的future状态变为ready，并且通过其可以获取存储的值。如果promise没有设置值就被销毁了，那么异常会被存储在future中。
+
+```c++
+// 一个使用std::promise的简单示例
+#include <iostream>
+#include <future>
+#include <string>
+
+std::promise<int> pm1;
+std::promise<std::string> pm2;
+
+void thread1(){
+	pm1.set_value(123);
+	pm2.set_value("hahah");
+}
+
+void thread2() {
+	auto future1 = pm1.get_future();
+	auto future2 = pm2.get_future();
+
+	std::cout << future1.get() << "\n"
+			  << future2.get() << std::endl;
+}
+int main()
+{
+	// thread1设置数据，thread2获取数据
+	auto t1 = std::thread(thread1);
+	auto t2 = std::thread(thread2);
+	
+	t1.join();
+	t2.join();
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果：
+
+```text
+123
+hahah
+
+
+```
+
+<h3 id="save_exception_for_future">future存储异常</h3>
+
+```c++
+// future存储exception示例
+#include <iostream>
+#include <future>
+#include <exception>
+
+double square_root(double x){
+	if (x<0){
+		throw std::out_of_range("x<0\n");
+	}
+	return sqrt(x);
+}
+
+int main()
+{	
+	try {
+		std::future<double> f = std::async(square_root, -1);
+		// future调用get时，会将存储的异常重新抛出，不调用不会抛出
+		double y = f.get();
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+
+	// std::packaged_task打包的函数抛出的异常也会被存储在关联future中
+	try {
+		std::packaged_task<double(double)> task(square_root);
+		task(-1);
+		auto ret = task.get_future().get();
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+
+	// std::promise可以使用set_exception成员函数设置一个异常到关联的future中
+	try {
+		std::promise<int> pm;
+		pm.set_exception(
+			// boost::copy_exception
+			std::make_exception_ptr(std::logic_error("my exception\n"))
+		);
+		std::cout << pm.get_future().get() << std::endl;
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();		
+	}
+
+	// std::promise.set_exception通常用于set_value发生异常时使用
+	std::promise<int> pm;
+	// 一个线程设置值
+	try {
+		pm.set_value(123);
+	}
+	catch (...) {
+		// std::current_exception: 当前异常
+		pm.set_exception(std::current_exception());
+	}
+	// 一个线程获取值
+	try {
+		std::cout << pm.get_future().get() << std::endl;
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果：
+
+```text
+x<0
+x<0
+my exception
+123
+
+
+```
+
+future存储异常的方式除了上面正常的方式外，如果在`std::packaged_task`被调用前，或在`std::promise`没有调用set系列函数前，其对象就销毁了，那么析构函数就会存储一个`std::future_errc::broken_promise`异常到其关联的future中。
+
+```c++
+~promise() _NOEXCEPT
+	{	// destroy
+	if (_MyPromise._Is_valid() && !_MyPromise._Is_ready() && !_MyPromise._Is_ready_at_thread_exit())
+		{	// exception if destroyed before function object returns
+		future_error _Fut(make_error_code(future_errc::broken_promise));
+		_MyPromise._Get_state()
+			._Set_exception(_STD make_exception_ptr(_Fut), false);
+		}
+	}
+
+~packaged_task() _NOEXCEPT
+	{	// destroy
+	_MyPromise._Get_state()._Abandon();
+	}
+void _Abandon()
+	{	// abandon shared state
+	unique_lock<mutex> _Lock(_Mtx);
+	if (!_Has_stored_result)
+		{	// queue exception
+		future_error _Fut(make_error_code(future_errc::broken_promise));
+		_Set_exception_raw(_STD make_exception_ptr(_Fut), &_Lock, false);
+		}
+	}
+```
+
+```c++
+// future存储exception
+#include <iostream>
+#include <future>
+#include <exception>
+
+double square_root(double x){
+	if (x<0){
+		throw std::out_of_range("x<0\n");
+	}
+	return sqrt(x);
+}
+
+int main()
+{	
+	std::future<double> f;
+
+	// std::packaged_task销毁异常
+	{
+		std::packaged_task<double(double)> task(square_root);
+		f = task.get_future();
+	}
+	try {
+		f.get();
+	}
+	catch (std::exception &e) {
+		std::cout << e.what() << "\n";
+	}
+
+	// std::promise销毁异常
+	{
+		std::promise<double> pm;
+		f = pm.get_future();
+	}
+	try {
+		f.get();
+	}
+	catch (std::exception &e) {
+		std::cout << e.what() << "\n";
+	}
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果(visual studio 2017):
+
+```c++
+broken promise
+broken promise
+
+
+```
