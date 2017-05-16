@@ -38,6 +38,12 @@ tags:
 	*   [std::packaged_task](#std_packaged_task)
 	*   [std::promise](#std_promise)
 	*   [future存储异常](#save_exception_for_future)
+	*   [std::shared_future](#std_shared_future)
+*   [限定等待时间](#wait_with_time_limit)
+	*   [时钟(clock)](#clock)
+	*   [持续时间(duration)](#duration)
+	*   [时间点(time point)](#time_point)
+	*   [具有超时功能的函数](#function_accept_timeouts)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
@@ -1100,7 +1106,7 @@ my_class& get_my_class_instance()
 
 <h3 id="boost_shared_mutex">boost::shared_mutex</h3>
 
-**如果数据很长时间才更新一次的话，使用mutex会降低性能**，因为大部分情况下都只是读取数据而非修改数据，这时**可以使用`boost::shared_mutex`来优化同步性能**。当数据进行更新操作时,可以使用`std::lock_guard<boost::shared_mutex>`和`std::unique_lock<boost::shared_mutex>`进行锁定,这能保证单独访问。这样做的唯一限制是：当一个线程尝试获取独占锁时，它需要等待其它拥有共享锁的线程解锁；当一个线程拥有独占锁时，其它线程不能获取独占锁或共享锁。
+**如果数据很长时间才更新一次的话，使用mutex会降低性能**，因为大部分情况下都只是读取数据而非修改数据，这时**可以使用`boost::shared_mutex`来优化同步性能**。当数据进行更新操作时,可以使用`std::lock_guard<boost::shared_mutex>`或`std::unique_lock<boost::shared_mutex>`进行锁定,这能保证单独访问。这样做的唯一限制是：当一个线程尝试获取独占锁时，它需要等待其它拥有共享锁的线程解锁；当一个线程拥有独占锁时，其它线程不能获取独占锁或共享锁。
 
 ```c++
 // 一个使用boost::shared_mutex的示例
@@ -1779,3 +1785,357 @@ broken promise
 
 
 ```
+
+<h3 id="std_shared_future">std::shared_future</h3>
+
+**`std::future`的局限性是只有一个线程能够获取等待结果，当有多个线程等待同一个事件时，可以使用`std::shared_future`**。
+
+```c++
+// std::shared_future的简单示例
+#include <iostream>
+#include <future>
+#include <exception>
+
+
+std::promise<int> pm;
+std::mutex cout_mut;
+
+// future.share传递所有权到一个shared_future
+// shared_future是可拷贝可移动的，各个拷贝会关联到同一个事件，获得同一个结果
+std::shared_future<int> sf = pm.get_future().share();
+
+void set_data(int a) {
+	try {
+		pm.set_value(a);
+	}
+	catch (std::exception &e) {
+		pm.set_exception(
+			std::make_exception_ptr(e)
+		);
+	}
+}
+
+void process1() {
+	// 拷贝sf而不是直接使用，这样能避免条件竞争
+	auto sf1 = sf;
+	auto value = sf1.get();
+	std::lock_guard<std::mutex> lg(cout_mut);
+	std::cout << "process1 value = "
+		<< value << std::endl;
+}
+
+void process2() {
+	// 拷贝sf而不是直接使用，这样能避免条件竞争
+	auto sf2 = sf;
+	auto value = sf2.get();
+	std::lock_guard<std::mutex> lg(cout_mut);
+	std::cout << "process2 value = "
+		<< value << std::endl;
+}
+
+int main()
+{	
+	auto t1 = std::thread(set_data, 123);
+	auto t2 = std::thread(process1);
+	auto t3 = std::thread(process2);
+
+	t1.join();
+	t2.join();
+	t3.join();
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+示例结果：
+
+```text
+process1 value = 123
+process2 value = 123
+
+
+```
+
+<h2 id="wait_with_time_limit">限定等待时间</h2>
+
+之前的线程阻塞都是等待某一事件发生，这不能保证等待的时间，但在某些特定情况时，你需要等待固定的时间，或到达某个时间点，就不能再等了。你可以把等待的时间或时间点看做一个事件。C++标准库提供这样的功能，一般以`_for`结尾的等待函数等待固定时间，以`_until`结尾的等待函数等待特定的时间点，如`std::condition_variable`的`wait_for`和`wait_until`函数。
+
+<h3 id="clock">时钟(clock)</h3>
+
+对C++标准库来说，clock是时间信息源，其提供四种信息：
+
+*	当前时间；
+*	用于表示clock包含的时间的值的类型，即时间类型；
+*	clock's 周期(tick period)；
+*	根据周期是否均匀，将clock判定为稳定(steady)或不稳定。
+
+**头文件`<chrono>`中有两种获取当前时间的函数：`std::chrono::steady_clock::now()`和`std::chrono::system_clock::now()`，其中`steady_clock`又被命名为`high_resolution_clock`**。
+
+时间的值的类型根据clock类型分为`chrono::time_point<steady_clock>`和`chrono::time_point<system_clock>`。
+
+**clock的周期(tick period)被指定为一秒内tick的次数**。如一个clock一秒内tick 25次，那么它的周期就是`std::ratio<1,25>`；若5秒内tick两次，其周期就是`std::ratio<5,2>`。
+
+如果clock周期(tick period)均匀，且不可调整，则这个clock就是稳定(steady)的。**可以根据类的静态成员变量`is_steady`来判断该clock类是否是steady的**，如`system_clock`的`is_steady`为false，`steady_clock`的`is_steady`为true。
+
+`system_clock`表示系统的真实时间，该类还提供了`time_point`向`time_t`的类型转换成员函数`to_time_t`。
+
+```c++
+// 获取当前时间的简单示例
+#include <iostream>
+#include <cstdlib>
+#include <chrono>
+#include <ctime>
+
+int main()
+{
+	//auto now_steady = std::chrono::steady_clock::now();
+	auto now_system = std::chrono::system_clock::now();
+	
+	auto now = std::chrono::system_clock::to_time_t(now_system);
+	std::cout << ctime(&now) << std::endl;  // unsafe way
+
+	// safe way
+	/*char buffer[26];
+	ctime_s(buffer, 26, &now);
+	std::cout << buffer << std::endl;*/
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+结果：
+
+```text
+Tue May 16 10:38:23 2017
+
+
+
+```
+
+<h3 id="duration">持续时间(duration)</h3>
+
+持续时间(duration)由`std::chrono::duration<>`模板进行处理，该模板的第一个模板参数为类型表示(int,long,double等)，第二个模板参数为每个持续时间(duration)单元代表的秒数。如`std::chrono::duration<short, std::ratio<60, 1> >`代表用short值存储分钟数，`std::chrono::duration<double, std::ratio<1, 1000> >`代表用double存储毫秒数。
+
+`<chrono>`头文件提供了一系列duration的预定义别名：
+
+```c++
+// SI TYPEDEFS
+typedef ratio<1, 1000000000000000000LL> atto;
+typedef ratio<1, 1000000000000000LL> femto;
+typedef ratio<1, 1000000000000LL> pico;
+
+typedef ratio<1, 1000000000> nano;
+typedef ratio<1, 1000000> micro;
+typedef ratio<1, 1000> milli;
+typedef ratio<1, 100> centi;
+typedef ratio<1, 10> deci;
+typedef ratio<10, 1> deca;
+typedef ratio<100, 1> hecto;
+typedef ratio<1000, 1> kilo;
+typedef ratio<1000000, 1> mega;
+typedef ratio<1000000000, 1> giga;
+
+typedef ratio<1000000000000LL, 1> tera;
+typedef ratio<1000000000000000LL, 1> peta;
+typedef ratio<1000000000000000000LL, 1> exa;
+
+// duration TYPEDEFS
+typedef duration<long long, nano> nanoseconds;
+typedef duration<long long, micro> microseconds;
+typedef duration<long long, milli> milliseconds;
+typedef duration<long long> seconds;
+typedef duration<int, ratio<60> > minutes;
+typedef duration<int, ratio<3600> > hours;
+```
+
+**可以使用`std::chrono::duration_cast<>`显式转换不同类型的duration**：
+
+```c++
+std::chrono::milliseconds ms(54802);
+std::chrono::seconds s =
+	std::chrono::duration_cast<std::chrono::seconds>(ms); // 54
+```
+
+duration支持各种算数运算：
+
+```c++
+// 获取单位时间的数量
+constexpr _Rep count() const
+	{	// get stored rep
+	return (_MyRep);
+	}
+
+constexpr _Myt operator+() const
+	{	// get value
+	return (*this);
+	}
+
+constexpr _Myt operator-() const
+	{	// get negated value
+	return (_Myt(0 - _MyRep));
+	}
+
+_Myt& operator++()
+	{	// increment rep
+	++_MyRep;
+	return (*this);
+	}
+
+_Myt operator++(int)
+	{	// postincrement rep
+	return (_Myt(_MyRep++));
+	}
+
+_Myt& operator--()
+	{	// decrement rep
+	--_MyRep;
+	return (*this);
+	}
+
+_Myt operator--(int)
+	{	// postdecrement rep
+	return (_Myt(_MyRep--));
+	}
+
+_Myt& operator+=(const _Myt& _Right)
+	{	// add _Right to rep
+	_MyRep += _Right._MyRep;
+	return (*this);
+	}
+
+_Myt& operator-=(const _Myt& _Right)
+	{	// subtract _Right from rep
+	_MyRep -= _Right._MyRep;
+	return (*this);
+	}
+
+_Myt& operator*=(const _Rep& _Right)
+	{	// multiply rep by _Right
+	_MyRep *= _Right;
+	return (*this);
+	}
+
+_Myt& operator/=(const _Rep& _Right)
+	{	// divide rep by _Right
+	_MyRep /= _Right;
+	return (*this);
+	}
+
+_Myt& operator%=(const _Rep& _Right)
+	{	// modulus rep by _Right
+	_MyRep %= _Right;
+	return (*this);
+	}
+
+_Myt& operator%=(const _Myt& _Right)
+	{	// modulus rep by _Right
+	_MyRep %= _Right.count();
+	return (*this);
+	}
+```
+
+```c++
+// 一个基于持续时间的future等待
+std::future<int> f = std::async(some_task);
+if (f.wait_for(std::chrono::milliseconds(35)) == std::future_status::ready)
+	do_something_with(f.get());
+```
+
+<h3 id="time_point">时间点(time point)</h3>
+
+时间点(time point)用`std::chrono::time_point<>`模板来表示，该模板的额第一个模板参数指定clock的类型(`system_clock`或`steady_clock`)，第二个模板参数指定计量单位(`std::chrono::duration<>`)。一个时间点的值是从某个特定时间点开始的时间长度(指定计量单位的倍数)，这个特定时间点一般是`1970/1/1 08:00:00`，clock间可以共享这个特定时间点，也可以独立拥有。
+
+```c++
+// 获取system_clock的epoch
+#include <iostream>
+#include <cstdlib>
+#include <chrono>
+#include <ctime>
+
+int main()
+{
+	// 方式一
+	auto time_point = std::chrono::system_clock::now();
+	// time_since_epoch获取从epoch开始直到time_point的时间长度
+	auto duration = time_point.time_since_epoch();
+	auto time_epoch = std::chrono::system_clock::to_time_t(time_point - duration);
+	std::cout << ctime(&time_epoch) << std::endl;
+
+	// 方式二
+	auto tp_epoch = std::chrono::time_point<std::chrono::system_clock>();
+	auto epoch = std::chrono::system_clock::to_time_t(tp_epoch);
+	std::cout << ctime(&epoch) << std::endl;
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+结果(visual studio 2017):
+
+```text
+Thu Jan  1 08:00:00 1970
+
+Thu Jan  1 08:00:00 1970
+
+
+
+```
+
+`time_point`类可以进行各种算数操作，如`time_point - time_point`，`time_point - duration`等等。
+
+```c++
+// 一个非常有用的计时操作
+#include <chrono>
+auto time_start = std::chrono::steady_clock::now();
+do_something();
+auto time_stop = std::chrono::steady_clock::now();
+std::cout << "grabcut took " << std::chrono::duration<double, std::milli>(time_stop - time_start).count() << " ms\n";
+```
+
+**推荐在写有时间限制的程序时，使用时间点进行等待**，原因使用下列程序进行说明：
+
+```c++
+#include <condition_variable>
+#include <mutex>
+#include <chrono>
+
+std::condition_variable cv;
+bool done;
+std::mutex m;
+
+bool wait_loop()
+{
+	// 你也可以使用system_clock::from_time_t从time_t获取一个time_point
+	auto const timeout = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(500);
+	std::unique_lock<std::mutex> lk(m);
+	while (!done)
+	{
+		/*
+		If you use wait_for() in a loop, you might end up waiting almost the full length of time before
+		a spurious wake, and the next time through the wait time starts again.This may repeatany number
+		of times, making the total wait time unbounded
+		*/
+		if (cv.wait_until(lk, timeout) == std::cv_status::timeout)
+			break;
+	}
+	return done;
+}
+```
+
+<h3 id="function_accept_timeouts">具有超时功能的函数</h3>
+
+一些常见的具有超时功能的函数：
+
+Class/Namespace | Functions | Return values
+------------------- | ----------------------- | --------------------------
+`std::this_thread` | `sleep_for(duration)` <br> `sleep_until(time_point)` | void
+`std::condition_variable` <br> `std::condition_variable_any` | `wait_for(lock, duration)` <br> `wait_until(lock, time_point)` | `std::cv_status::no_timeout` <br> `std::cv_status::timeout`
+`std::condition_variable` <br> `std::condition_variable_any` | `wait_for(lock,duration,predicate)` <br> `wait_until(lock,time_point,predicate)` | bool
+`std::timed_mutex` <br> `std::recursive_timed_mutex` | `try_lock_for(duration)` <br> `try_lock_until(time_point)` | 成功返回true
+`std::unique_lock<TimedLockable>` | `unique_lock(lockable,duration)` <br> `unique_lock(lockable,time_point)` | 构造函数
+`std::unique_lock<TimedLockable>` | `try_lock_for(duration)` <br> `try_lock_until(time_point)` | 成功返回true
+`std::future<ValueType>` <br> `std::shared_future<ValueType>` | `wait_for(duration)` <br> `wait_until(time_point)` | `std::future_status::ready` <br> `std::future_status::timeout` <br> `std::future_status::deferred`
