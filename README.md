@@ -44,6 +44,9 @@ tags:
 	*   [持续时间(duration)](#duration)
 	*   [时间点(time point)](#time_point)
 	*   [具有超时功能的函数](#function_accept_timeouts)
+*   [使用同步操作简化代码](#simplify_code_with_synchronization)
+	*   [使用future的函数化编程(functional programming)](#functional_program_with_future)
+	*   [使用消息传递的同步操作](#synchronize_operations_with_message_passing)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
@@ -2092,7 +2095,7 @@ Thu Jan  1 08:00:00 1970
 auto time_start = std::chrono::steady_clock::now();
 do_something();
 auto time_stop = std::chrono::steady_clock::now();
-std::cout << "grabcut took " << std::chrono::duration<double, std::milli>(time_stop - time_start).count() << " ms\n";
+std::cout << "took " << std::chrono::duration<double, std::milli>(time_stop - time_start).count() << " ms\n";
 ```
 
 **推荐在写有时间限制的程序时，使用时间点进行等待**，原因使用下列程序进行说明：
@@ -2139,3 +2142,131 @@ Class/Namespace | Functions | Return values
 `std::unique_lock<TimedLockable>` | `unique_lock(lockable,duration)` <br> `unique_lock(lockable,time_point)` | 构造函数
 `std::unique_lock<TimedLockable>` | `try_lock_for(duration)` <br> `try_lock_until(time_point)` | 成功返回true
 `std::future<ValueType>` <br> `std::shared_future<ValueType>` | `wait_for(duration)` <br> `wait_until(time_point)` | `std::future_status::ready` <br> `std::future_status::timeout` <br> `std::future_status::deferred`
+
+<h2 id="simplify_code_with_synchronization">使用同步操作简化代码</h2>
+
+<h3 id="functional_program_with_future">使用future的函数化编程(functional programming)</h3>
+
+函数化编程(functional programming)是指一个函数调用的结果只依赖于传入的参数，而与其它外部状态无关。这意味着如果你用相同的参数对同一个函数调用两次的结果肯定是一样的。
+
+future使得函数化编程模式在C++中变得可以并行运行，future可以在线程间传递，并且允许一个结果依赖于另一个结果，而不用显式访问共享数据。
+
+```c++
+// 一个简单的例子
+#include <iostream>
+#include <cstdlib>
+#include <list>
+#include <algorithm>
+#include <future>
+#include <iterator>
+
+template<typename T>
+std::list<T> sequential_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	std::list<T> result;
+	// l.splice(iterator pos,list& x, iterator i)
+	// 将x中i指向的元素移动插入到l中pos指向的位置之前
+	result.splice(result.begin(), input, input.begin());
+	T const& pivot = *result.begin();
+
+	// std::partition(iterator beg, iterator end, func)
+	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
+	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
+	auto divide_point = std::partition(input.begin(), input.end(),
+		[&](T const& t) {return t<pivot; });
+
+	std::list<T> lower_part;
+	// l.splice(iterator pos,list& x, iterator beg, iterator end)
+	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
+	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
+
+	auto new_lower(
+		sequential_quick_sort(std::move(lower_part)));
+	auto new_higher(
+		sequential_quick_sort(std::move(input)));
+
+	// l.splice(iterator pos,list& x)
+	// 将x中所有元素移动插入到l中pos指向的位置之前
+	result.splice(result.end(), new_higher);
+	result.splice(result.begin(), new_lower);
+	return result;
+}
+
+template<typename T>
+std::list<T> parallel_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	std::list<T> result;
+	result.splice(result.begin(), input, input.begin());
+	T const& pivot = *result.begin();
+
+	auto divide_point = std::partition(input.begin(), input.end(),
+		[&](T const& t) {return t<pivot; });
+
+	std::list<T> lower_part;
+	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
+
+	// 小于pivot的元素在新线程中运行，任务数按递归次数呈指数增长
+	// 当任务数太多时，这些任务会在调用get()的线程上运行而不是开启一个新线程
+	// 这是因为async的默认参数std::launch::deferred | std::launch::async会自动切换
+	std::future<std::list<T> > new_lower(
+		std::async(&parallel_quick_sort<T>, std::move(lower_part)));
+
+	auto new_higher(
+		parallel_quick_sort(std::move(input))); 
+
+	result.splice(result.end(), new_higher);
+	result.splice(result.begin(), new_lower.get());
+	return result;
+}
+
+int main()
+{
+	// 顺序执行
+	std::list<int> l{ 5,7,6,1,4,3,2 };
+	auto time_start = std::chrono::steady_clock::now();
+	auto res = sequential_quick_sort(l);
+	auto time_end = std::chrono::steady_clock::now();
+	std::cout << std::chrono::duration<double, std::milli>(time_end - time_start).count() << "ms.\n";
+
+	std::ostream_iterator<int> out(std::cout, " ");
+	copy(std::cbegin(res), std::cend(res), out);
+	std::cout << std::endl;
+
+	// 简化版
+	time_start = std::chrono::steady_clock::now();
+	res = parallel_quick_sort(l);
+	time_end = std::chrono::steady_clock::now();
+	std::cout << std::chrono::duration<double, std::milli>(time_end - time_start).count() << "ms.\n";
+
+	copy(std::cbegin(res), std::cend(res), out);
+	std::cout << std::endl;
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+结果：
+
+```text
+0.622224ms.
+1 2 3 4 5 6 7
+1.37467ms.
+1 2 3 4 5 6 7
+
+
+```
+
+<h3 id="synchronize_operations_with_message_passing">使用消息传递的同步操作</h3>
+
+CSP(Communicating Sequential Processes)：当没有共享数据，每个线程就可以进行独立思考，其行为纯粹基于其所接收到的信息，这样每个线程就相当于一个状态机。
+
+ATM机作为一个典型的状态机模型，下面就来做一个简单的实现。
