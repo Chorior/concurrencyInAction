@@ -29,7 +29,7 @@ tags:
 	*   [死锁](#dead_lock)
 	*   [避免死锁的进阶指导](#advanced_guide_of_dead_lock)
 	*   [std::unique_lock](#std_unique_lock)
-	*   [std::once_flag和std::call_once](#std_onceflag_and_callonce)
+	*   [std::once_flag,std::call_once](#std_onceflag_and_callonce)
 	*   [boost::shared_mutex](#boost_shared_mutex)
 *   [多线程同步](#synchronizing_thread)
 	*   [条件变量(condition variables)](#condition_variable)
@@ -142,6 +142,7 @@ int main()
 **每个程序至少有一个线程：执行main()函数的线程**，其余线程有其各自的入口函数。线程与原始线程(以main()为入口函数的线程)同时运行。如同main()函数执行完会退出一样，当线程执行完入口函数后，线程也会退出。
 
 ```c++
+// 标准库thread类
 class thread
 {	// class for observing and managing threads
 public:
@@ -237,19 +238,19 @@ public:
 
 通过查看thread类的公有成员，我们得知：
 
-*   thread类包含三个构造函数：一个默认构造函数(什么都不做)、一个接受可调用对象及其参数的explicit构造函数(参数可能没有，这时相当于转换构造函数，需要定义为explicit)、和一个移动构造函数；
-*   析构函数会在thread对象销毁时自动调用，如果销毁时thread对象还是joinable，那么程序会调用terminate()终止进程；
+*   **thread类包含三个构造函数**：一个默认构造函数(什么都不做)、一个接受可调用对象及其参数的explicit构造函数(参数可能没有，这时相当于转换构造函数，需要定义为explicit)、和一个移动构造函数；
+*   **析构函数会在thread对象销毁时自动调用，如果销毁时thread对象还是joinable，那么程序会调用terminate()终止进程**；
 *   thread类没有拷贝操作，只有移动操作，即**thread对象是可移动不可拷贝的**，这保证了在同一时间点，一个thread实例只能关联一个执行线程；
 *   swap函数用来交换两个thread对象管理的线程；
 *   joinable函数用来判断该thread对象是否是可加入的；
 *   join函数使得该thread对象管理的线程加入到原始线程，**只能使用一次**，并使joinable为false；
-*   detach函数使得该thread对象管理的线程与原始线程分离，独立运行，并使joinable为false；
+*   detach函数使得该thread对象管理的线程**与原始线程分离，独立运行**，并使joinable为false；
 *   `get_id`返回线程标识；
 *   `hardware_concurrency`返回能同时并发在一个程序中的线程数量，当系统信息无法获取时，函数也会返回0。
 
 **调用`join()`清理了与线程相关的存储部分，所以该thread对象不再与任何线程相关联直到重新赋值** 。
 
-detach线程又称守护线程(daemon threads)，**C++运行库保证，当detach线程退出时，相关资源的能够正确回收，后台线程的归属和控制C++运行库都会处理**。
+detach线程又称守护线程(daemon threads)，**C++运行库保证，当detach线程退出时，相关资源的能够正确回收，后台线程的归属和控制，C++运行库都会处理**。
 
 <h3 id="start_a_thread">线程启动</h3>
 
@@ -267,7 +268,7 @@ detach线程又称守护线程(daemon threads)，**C++运行库保证，当detac
 
 **如果参数需要转换才能匹配函数,最好使用显式转换**,因为默认转换也许在没有转换成功之前住线程就结束了；**如果线程参数是引用类型,传递参数时,一定要使用`std::ref(arg)`**；**如果线程函数是成员函数，那么需要传递一个合适的对象实例指针,后跟成员函数参数**。
 
-根据析构函数，可以知道：在构造一个thread对象之后，需要决定调用`join()`或是`detach()`。如果要调用`detach()`，那么需要保证线程结束之前，可访问的数据的有效性，举个栗子，detach的线程如果包含原始线程的局部变量的指针或引用，就很大概率会出现问题。
+根据析构函数，可以知道：在构造一个thread对象之后，需要决定调用`join()`或是`detach()`。如果要调用`detach()`，那么需要保证线程结束之前，可访问的数据的有效性，举个栗子，**detach的线程如果包含原始线程的局部变量的指针或引用，就很大概率会出现问题**。
 
 **detach的线程通常将要用的数据全部复制到自己的线程中**。
 
@@ -401,7 +402,7 @@ void f()
 *   成员函数`std::thread::get_id()`，当没有线程与该thread对象关联时，此函数返回0；
 *   命名空间函数`std::this_thread::get_id()`；
 
-如果两个对象的`std::thread::id`相等，那它们就是同一个线程，或者都“没有线程”。如果不等，那么就代表了两个不同线程，或者一个有线程，另一没有。
+**如果两个对象的`std::thread::id`相等，那它们就是同一个线程，或者都“没有线程”。如果不等，那么就代表了两个不同线程，或者一个有线程，另一没有**。
 
 ```c++
 // std::thread::id 支持的各种操作
@@ -458,7 +459,7 @@ template<>
 	};
 ```
 
-查看`std::thread::id`源代码，发现其支持`==,!=,<,<=,>,>=,<<`运算符，还定义了hash模板的特例化版本，所以`std::thread::id`支持各种算法和无序容器，甚至可以用来作为键值。
+查看`std::thread::id`源代码，发现其支持`==,!=,<,<=,>,>=,<<`运算符，还定义了hash模板的特例化版本，所以**`std::thread::id`支持各种算法和无序容器，甚至可以用来作为键值**。
 
 <h2 id="sharing_data_between_threads">线程间共享数据</h2>
 
@@ -470,7 +471,7 @@ template<>
 
 <h3 id="std_mutex">std::mutex</h3>
 
-**C++标准保护共享数据最基本的技巧是使用互斥量(mutex)**：当访问共享数据前，使用互斥量将相关数据锁住，再当访问结束后，再将数据解锁。线程库需要保证，当一个线程使用特定互斥量锁住共享数据时，其他的线程想要访问锁住的数据，都必须等到之前那个线程对数据进行解锁后，才能进行访问。
+**C++标准保护共享数据最基本的技巧是使用互斥量(mutex)**：当访问共享数据前，使用互斥量将相关数据锁住，再当访问结束后，再将数据解锁。线程库需要保证，**当一个线程使用特定互斥量锁住共享数据时，其他的线程想要访问锁住的数据，都必须等到之前那个线程对数据进行解锁后，才能进行访问**。
 
 在C++中使用互斥量
 
@@ -1035,7 +1036,7 @@ public:
 };
 ```
 
-<h3 id="std_onceflag_and_callonce">std::once_flag和std::call_once</h3>
+<h3 id="std_onceflag_and_callonce">std::once_flag,std::call_once</h3>
 
 如果数据初始化后锁住一个互斥量，纯粹是为了保护其初始化过程，那么这是没有必要的，并且这会给性能带来不必要的冲击。出于以上的原因，C++标准提供了一种纯粹保护共享数据初始化过程的机制。
 
@@ -1143,7 +1144,7 @@ public:
 
 <h2 id="synchronizing_thread">多线程同步</h2>
 
-在一个线程完成之前，可能需要等待另一个线程执行完成(如双目摄像头的图像获取显示)，这种情况就需要线程同步。C++标准库提供条件变量(condition variables)和期望(futures)来处理线程同步问题。
+在一个线程完成之前，可能需要等待另一个线程执行完成(如双目摄像头的图像获取显示)，这种情况就需要线程同步。**C++标准库提供条件变量(condition variables)和期望(futures)来处理线程同步问题**。
 
 当一个线程等待另一个线程完成任务时，可以有很多种方法：
 
@@ -1403,9 +1404,9 @@ public:
 ```
 
 *	发现future的父类是`_State_manager`模板，`_State_manager`模板包含一些状态管理的操作；
-*	一个非常有用的函数是`get()`函数，该函数阻塞直到future状态变为ready，然后返回结果；
+*	**一个非常有用的函数是`get()`函数，该函数阻塞直到future状态变为ready，然后返回结果**；
 *	另外几个非常有用的wait系列函数来自`_State_manager`模板：
-	*	`wait()`函数阻塞直到结果变为有效(valid)；
+	*	**`wait()`函数阻塞直到结果变为有效(valid)**；
 	*	`wait_for(time)`如果结果在指定时间内还不可用(valid)，那么会返回timeout；
 	*	`wait_until(timepoint)`如果到达指定时间点时结果还不可用(valid)，那么会返回timeout。
 
@@ -2048,7 +2049,7 @@ if (f.wait_for(std::chrono::milliseconds(35)) == std::future_status::ready)
 
 <h3 id="time_point">时间点(time point)</h3>
 
-时间点(time point)用`std::chrono::time_point<>`模板来表示，该模板的额第一个模板参数指定clock的类型(`system_clock`或`steady_clock`)，第二个模板参数指定计量单位(`std::chrono::duration<>`)。一个时间点的值是从某个特定时间点开始的时间长度(指定计量单位的倍数)，这个特定时间点一般是`1970/1/1 08:00:00`，clock间可以共享这个特定时间点，也可以独立拥有。
+时间点(time point)用`std::chrono::time_point<>`模板来表示，该模板的第一个模板参数指定clock的类型(`system_clock`或`steady_clock`)，第二个模板参数指定计量单位(`std::chrono::duration<>`)。一个时间点的值是从某个特定时间点开始的时间长度(指定计量单位的倍数)，这个特定时间点一般是`1970/1/1 08:00:00`，clock间可以共享这个特定时间点，也可以独立拥有。
 
 ```c++
 // 获取system_clock的epoch
