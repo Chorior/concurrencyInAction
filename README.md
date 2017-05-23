@@ -46,7 +46,7 @@ tags:
 	*   [具有超时功能的函数](#function_accept_timeouts)
 *   [使用同步操作简化代码](#simplify_code_with_synchronization)
 	*   [使用future的函数化编程(functional programming)](#functional_program_with_future)
-	*   [使用消息传递的同步操作](#synchronize_operations_with_message_passing)
+	*   [状态机](#synchronize_operations_with_message_passing)
 
 <h2 id="multithreading_overview">多线程概述</h2>
 
@@ -2265,8 +2265,1007 @@ int main()
 
 ```
 
-<h3 id="synchronize_operations_with_message_passing">使用消息传递的同步操作</h3>
+<h3 id="synchronize_operations_with_message_passing">状态机</h3>
 
-CSP(Communicating Sequential Processes)：当没有共享数据，每个线程就可以进行独立思考，其行为纯粹基于其所接收到的信息，这样每个线程就相当于一个状态机。
+**CSP(Communicating Sequential Processes)：当没有共享数据，每个线程就可以进行独立思考，其行为纯粹基于其所接收到的信息，这样每个线程就相当于一个状态机**。
 
 ATM机作为一个典型的状态机模型，下面就来做一个简单的实现。
+
+<h4 id="header_atm_h">ATM.h</h4>
+
+```c++
+#ifndef _ATM_H_
+#define _ATM_H_
+
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <memory>
+#include <iostream>
+
+namespace messaging
+{
+	// 邮件基类
+	struct message_base
+	{
+		virtual ~message_base()
+		{}
+	};
+
+	// 每种邮件有自己的类型，由模板参数Msg指定
+	template<typename Msg>
+	struct wrapped_message : message_base
+	{
+		Msg contents;
+		explicit wrapped_message(Msg const& contents_) :
+			contents(contents_)
+		{}
+	};
+
+	// 邮箱
+	class queue
+	{
+		std::mutex m;
+		std::condition_variable c;
+		// 标准库队列存储着邮件基类的智能指针
+		// 指向派生类的基类的指针可以使用dynamic_cast转换回派生类指针
+		std::queue<std::shared_ptr<message_base> > q;
+
+	public:
+
+		queue() = default;
+
+		// 不需要拷贝操作
+		queue(const queue&) = delete;
+		queue& operator=(const queue&) = delete;
+
+		template<typename T>
+		void push(T const& msg)
+		{
+			std::lock_guard<std::mutex> lk(m);
+			// 压入派生类的智能指针
+			q.push(std::make_shared<wrapped_message<T> >(msg));
+			c.notify_all();
+		}
+
+		std::shared_ptr<message_base> wait_and_pop()
+		{
+			std::unique_lock<std::mutex> lk(m);
+			// 阻塞等待，直到q不为空
+			c.wait(lk, [&] {return !q.empty(); });
+			auto res = q.front();
+			q.pop();
+			return res;
+		}
+	};
+
+	// 关闭的邮箱，如果你收到它里面的邮件，你会遇到鬼(发生异常)
+	class close_queue
+	{};
+
+	// 邮递员模板
+	// PreviousDispatcher: 上一个邮递员(交接)
+	// Msg: 该邮递员能处理的邮件类型
+	// Func: 该邮递员处理该邮件的方式
+	template<typename PreviousDispatcher, typename Msg, typename Func>
+	class TemplateDispatcher
+	{
+		queue* q;                  // 管理的邮箱地址
+		PreviousDispatcher* prev;  // 上一个邮递员的地址
+		Func f;                    // 该邮递员处理该邮件的方式
+		bool chained;              // 该邮递员是否离职        
+
+								   // 不需要拷贝操作
+		TemplateDispatcher(TemplateDispatcher const&) = delete;
+		TemplateDispatcher& operator=(TemplateDispatcher const&) = delete;
+
+		// 邮递员间都是朋友，需要帮助的时候可以相互照应
+		template<typename Dispatcher, typename OtherMsg, typename OtherFunc>
+		friend class TemplateDispatcher;
+
+		// 邮递员等待邮箱邮件，然后派件
+		void wait_and_dispatch()
+		{
+			for (;;)
+			{
+				auto msg = q->wait_and_pop();
+				// 如果该邮递员能够处理这个邮件，那么他需要外出处理这次派件
+				// 如果该邮件不能处理，那么该邮件会被丢弃
+				if (dispatch(msg))
+					break;
+			}
+		}
+
+		// 邮递员派件
+		bool dispatch(std::shared_ptr<message_base> const& msg)
+		{
+			// 检查该邮件类型是否是自己能处理的邮件类型
+			// 若是，则按照往常的方式处理该邮件
+			// 若不是，该邮递员处理不了这个邮件，向上一个邮递员求助
+			if (wrapped_message<Msg>* wrapper =
+				dynamic_cast<wrapped_message<Msg>*>(msg.get()))
+			{
+				f(wrapper->contents);
+				return true;
+			}
+			else
+			{
+				return prev->dispatch(msg);
+			}
+		}
+
+	public:
+
+		// 移动构造函数，邮递员other不干了，将任务全部交给下一个人
+		TemplateDispatcher(TemplateDispatcher&& other) :
+			q(other.q),
+			prev(other.prev),
+			f(std::move(other.f)),
+			chained(other.chained)
+		{
+			other.chained = true;
+		}
+
+		// 新官上任，prev_进行交接
+		TemplateDispatcher(queue* q_, PreviousDispatcher* prev_, Func&& f_) :
+			q(q_),
+			prev(prev_),
+			f(std::forward<Func>(f_)),
+			chained(false)
+		{
+			prev_->chained = true;
+		}
+
+		// 该邮递员有权利将管理的邮箱的邮件交给临时工派件
+		template<typename OtherMsg, typename OtherFunc>
+		TemplateDispatcher<TemplateDispatcher, OtherMsg, OtherFunc>
+			handle(OtherFunc&& of)
+		{
+			// 临时对象返回时会进行析构，析构时会进行一次派件任务			
+			return TemplateDispatcher<
+				TemplateDispatcher, OtherMsg, OtherFunc>(
+					q, this, std::forward<OtherFunc>(of));
+		}
+
+		// noexcept(false)：可以抛出异常
+		~TemplateDispatcher() noexcept(false)
+		{
+			// 若未离职，则至少需要完成一次派件
+			if (!chained)
+			{
+				wait_and_dispatch();
+			}
+		}
+	};
+
+	// 邮件验收者
+	class dispatcher
+	{
+		queue* q;
+		bool chained;
+
+		// 不需要拷贝操作
+		dispatcher(dispatcher const&) = delete;
+		dispatcher& operator=(dispatcher const&) = delete;
+
+		// 邮件验收者和邮递员都是朋友
+		template<
+			typename Dispatcher,
+			typename Msg,
+			typename Func>
+			friend class TemplateDispatcher;
+
+		void wait_and_dispatch()
+		{
+			for (;;)
+			{
+				auto msg = q->wait_and_pop();
+				dispatch(msg);
+			}
+		}
+
+		// 邮件验收者确认邮件是不是属于已关闭的邮箱
+		// 该函数会在邮递员处理不了某一邮件时被调用
+		bool dispatch(
+			std::shared_ptr<message_base> const& msg)
+		{
+			if (dynamic_cast<wrapped_message<close_queue>*>(msg.get()))
+			{
+				throw close_queue();
+			}
+
+			return false;
+		}
+
+	public:
+
+		// 邮件验收者不干了(移动构造函数)
+		dispatcher(dispatcher&& other) :
+			q(other.q),
+			chained(other.chained)
+		{
+			other.chained = true;
+		}
+
+		// 新官上任
+		explicit dispatcher(queue* q_) :
+			q(q_),
+			chained(false)
+		{}
+
+		// 邮件验收者处理邮件的方式就是交给相应的邮递员去派件
+		template<typename Message, typename Func>
+		TemplateDispatcher<dispatcher, Message, Func>
+			handle(Func&& f)
+		{
+			return TemplateDispatcher<dispatcher, Message, Func>(
+				q, this, std::forward<Func>(f));
+		}
+
+		// 邮件验收者也需要至少验收一次派件
+		~dispatcher() noexcept(false)
+		{
+			if (!chained)
+			{
+				wait_and_dispatch();
+			}
+		}
+	};
+
+	// 邮件发送者
+	class sender
+	{
+		queue *q; // 该邮件发送者寄送邮件邮箱地址
+
+	public:
+
+		// 邮件发送者小白并不知道邮箱地址
+		sender() : q(nullptr)
+		{}
+
+		// 邮件发送者长者自带一个邮箱地址
+		explicit sender(queue *q_) : q(q_)
+		{}
+
+		// 发送邮件，将邮件投入邮箱即可
+		// 拷贝操作是允许的，给小白留了一条活路
+		template<typename Message>
+		void send(Message const& msg)
+		{
+			if (q)
+			{
+				q->push(msg);
+			}
+		}
+	};
+
+	// 邮件接收人
+	class receiver
+	{
+		queue q; // 邮件接收人拥有一个专属的邮箱
+
+	public:
+
+		// 类型转换运算符
+		// 邮件接收人可以转换成邮件发送者进行回信
+		operator sender()
+		{
+			return sender(&q);
+		}
+
+		// 等待邮件验收者验收邮件
+		dispatcher wait()
+		{
+			return dispatcher(&q);
+		}
+	};
+}
+
+struct withdraw
+{
+	std::string account;
+	unsigned amount;
+	mutable messaging::sender atm_queue;
+
+	withdraw(
+		std::string const& account_,
+		unsigned amount_,
+		messaging::sender atm_queue_) :
+		account(account_),
+		amount(amount_),
+		atm_queue(atm_queue_)
+	{}
+};
+
+struct withdraw_ok
+{};
+
+struct withdraw_denied
+{};
+
+struct cancel_withdrawal
+{
+	std::string account;
+	unsigned amount;
+
+	cancel_withdrawal(
+		std::string const& account_,
+		unsigned amount_) :
+		account(account_),
+		amount(amount_)
+	{}
+};
+
+struct withdrawal_processed
+{
+	std::string account;
+	unsigned amount;
+
+	withdrawal_processed(
+		std::string const& account_,
+		unsigned amount_) :
+		account(account_),
+		amount(amount_)
+	{}
+
+};
+
+struct card_inserted
+{
+	std::string account;
+
+	explicit card_inserted(std::string const& account_) :
+		account(account_)
+	{}
+
+};
+
+struct digit_pressed
+{
+	char digit;
+
+	explicit digit_pressed(char digit_) :
+		digit(digit_)
+	{}
+
+};
+
+struct clear_last_pressed
+{};
+
+struct eject_card
+{};
+
+struct withdraw_pressed
+{
+	unsigned amount;
+
+	explicit withdraw_pressed(unsigned amount_) :
+		amount(amount_)
+	{}
+
+};
+
+struct cancel_pressed
+{};
+
+struct issue_money
+{
+	unsigned amount;
+
+	issue_money(unsigned amount_) :
+		amount(amount_)
+	{}
+};
+
+struct verify_pin
+{
+	std::string account;
+	std::string pin;
+	mutable messaging::sender atm_queue;
+
+	verify_pin(
+		std::string const& account_,
+		std::string const& pin_,
+		messaging::sender atm_queue_) :
+		account(account_),
+		pin(pin_),
+		atm_queue(atm_queue_)
+	{}
+};
+
+struct pin_verified
+{};
+
+struct pin_incorrect
+{};
+
+struct display_enter_pin
+{};
+
+struct display_enter_card
+{};
+
+struct display_insufficient_funds
+{};
+
+struct display_withdrawal_cancelled
+{};
+
+struct display_pin_incorrect_message
+{};
+
+struct display_withdrawal_options
+{};
+
+struct get_balance
+{
+	std::string account;
+	mutable messaging::sender atm_queue;
+
+	get_balance(std::string const& account_, messaging::sender atm_queue_) :
+		account(account_),
+		atm_queue(atm_queue_)
+	{}
+};
+
+struct balance
+{
+	unsigned amount;
+
+	explicit balance(unsigned amount_) :
+		amount(amount_)
+	{}
+};
+
+struct display_balance
+{
+	unsigned amount;
+
+	explicit display_balance(unsigned amount_) :
+		amount(amount_)
+	{}
+};
+
+struct balance_pressed
+{};
+
+// ATM逻辑业务状态机，从run函数开始看
+class atm
+{
+	messaging::receiver incoming;          // 邮件接收人
+	messaging::sender bank;                // 邮件发送者1--银行
+	messaging::sender interface_hardware;  // 邮件发送者2--人机交互界面
+	void (atm::*state)();                  // atm机状态
+	std::string account;                   // 用户账户
+	unsigned withdrawal_amount;            // 取款金额
+	std::string pin;                       // 账户密码
+
+	void process_withdrawal()
+	{
+		incoming.wait()
+			.handle<withdraw_ok>(
+				[&](withdraw_ok const& msg)
+		{
+			interface_hardware.send(
+				issue_money(withdrawal_amount));
+
+			bank.send(
+				withdrawal_processed(account, withdrawal_amount));
+
+			state = &atm::wait_for_action;
+		}
+				)
+			.handle<withdraw_denied>(
+				[&](withdraw_denied const& msg)
+		{
+			// 余额不足
+			interface_hardware.send(display_insufficient_funds());
+
+			state = &atm::wait_for_action;
+		}
+				)
+			.handle<cancel_pressed>(
+				[&](cancel_pressed const& msg)
+		{
+			bank.send(
+				cancel_withdrawal(account, withdrawal_amount));
+
+			interface_hardware.send(
+				display_withdrawal_cancelled());
+
+			state = &atm::done_processing;
+		}
+		);
+	}
+
+	void process_balance()
+	{
+		incoming.wait()
+			.handle<balance>(
+				[&](balance const& msg)
+		{
+			interface_hardware.send(display_balance(msg.amount));
+
+			state = &atm::wait_for_action;
+		}
+				)
+			.handle<cancel_pressed>(
+				[&](cancel_pressed const& msg)
+		{
+			state = &atm::done_processing;
+		}
+		);
+	}
+
+	void wait_for_action()
+	{
+		interface_hardware.send(display_withdrawal_options());
+
+		incoming.wait()
+			.handle<withdraw_pressed>(
+				[&](withdraw_pressed const& msg)
+		{
+			withdrawal_amount = msg.amount;
+
+			// 提款
+			bank.send(withdraw(account, msg.amount, incoming));
+
+			state = &atm::process_withdrawal;
+		}
+				)
+			.handle<balance_pressed>(
+				[&](balance_pressed const& msg)
+		{
+			// 获取余额
+			bank.send(get_balance(account, incoming));
+
+			state = &atm::process_balance;
+		}
+				)
+			.handle<cancel_pressed>(
+				[&](cancel_pressed const& msg)
+		{
+			state = &atm::done_processing;
+		}
+		);
+	}
+
+	void verifying_pin()
+	{
+		incoming.wait()
+			.handle<pin_verified>(
+				[&](pin_verified const& msg)
+		{
+			state = &atm::wait_for_action;
+		}
+				)
+			.handle<pin_incorrect>(
+				[&](pin_incorrect const& msg)
+		{
+			interface_hardware.send(
+				display_pin_incorrect_message());
+
+			state = &atm::done_processing;
+		}
+				)
+			.handle<cancel_pressed>(
+				[&](cancel_pressed const& msg)
+		{
+			state = &atm::done_processing;
+		}
+		);
+	}
+
+	void getting_pin()
+	{
+		incoming.wait()
+			.handle<digit_pressed>(
+				[&](digit_pressed const& msg)
+		{
+			unsigned const pin_length = 4; // 数字密码长度假定为4
+			pin += msg.digit;
+
+			if (pin.length() == pin_length)
+			{
+				// 向银行去人密码是否正确
+				bank.send(verify_pin(account, pin, incoming));
+
+				// atm状态迁移为确认密码
+				state = &atm::verifying_pin;
+			}
+		}
+				)
+			.handle<clear_last_pressed>(
+				[&](clear_last_pressed const& msg)
+		{
+			if (!pin.empty())
+			{
+				pin.pop_back();
+			}
+		}
+				)
+			// 取消将退出卡片
+			.handle<cancel_pressed>(
+				[&](cancel_pressed const& msg)
+		{
+			state = &atm::done_processing;
+		}
+		);
+	}
+
+	void waiting_for_card()
+	{
+		// 人机交互界面显示插入卡片提示
+		interface_hardware.send(display_enter_card());
+
+		// 等待卡片插入
+		incoming.wait()
+			.handle<card_inserted>(
+				[&](card_inserted const& msg)
+		{
+			account = msg.account; // 获取卡片账户
+			pin = "";              // 等待用户输入密码
+
+			// 人机交互界面显示输入密码提示
+			interface_hardware.send(display_enter_pin());
+
+			// atm状态迁移为获取密码
+			state = &atm::getting_pin;
+		}
+		);
+	}
+
+	void done_processing()
+	{
+		interface_hardware.send(eject_card());
+
+		state = &atm::waiting_for_card;
+	}
+
+	atm(atm const&) = delete;
+	atm& operator=(atm const&) = delete;
+
+public:
+
+	atm(
+		messaging::sender bank_,
+		messaging::sender interface_hardware_) :
+		bank(bank_),
+		interface_hardware(interface_hardware_)
+	{}
+
+	// ATM机坏掉了
+	void done()
+	{
+		get_sender().send(messaging::close_queue());
+	}
+
+	void run()
+	{
+		// 初始状态：等待用户插入卡片
+		state = &atm::waiting_for_card;
+		try
+		{
+			for (;;)
+			{
+				// 循环当前状态
+				(this->*state)();
+			}
+		}
+		catch (messaging::close_queue const&)
+		{
+		}
+	}
+
+	// 暴露收件人信息，这样才能向incoming发送邮件
+	messaging::sender get_sender()
+	{
+		return incoming;
+	}
+};
+
+// 银行状态机，从run开始看
+class bank_machine
+{
+	messaging::receiver incoming;
+	unsigned balance;
+
+public:
+
+	bank_machine() :
+		balance(199) // 假定默认余额为199
+	{}
+
+	// 银行破产了
+	void done()
+	{
+		get_sender().send(messaging::close_queue());
+	}
+
+	void run()
+	{
+		try
+		{
+			for (;;)
+			{
+				incoming.wait()
+					.handle<verify_pin>(
+						[&](verify_pin const& msg)
+				{
+					if (msg.pin == "1937") // 默认密码1937
+					{
+						msg.atm_queue.send(pin_verified());
+					}
+					else
+					{
+						msg.atm_queue.send(pin_incorrect());
+					}
+				}
+						)					
+					.handle<withdraw>(
+						[this](withdraw const& msg)
+				{					
+					if (this->balance >= msg.amount)
+					{
+						msg.atm_queue.send(withdraw_ok());
+						this->balance -= msg.amount;
+					}
+					else
+					{
+						msg.atm_queue.send(withdraw_denied());
+					}
+				}
+						)
+					.handle<get_balance>(
+						[&](get_balance const& msg)
+				{
+					msg.atm_queue.send(::balance(balance));
+				}
+						)
+					.handle<withdrawal_processed>(
+						[&](withdrawal_processed const& msg)
+				{
+				}
+						)
+					.handle<cancel_withdrawal>(
+						[&](cancel_withdrawal const& msg)
+				{
+				}
+				);
+			}
+		}
+		catch (messaging::close_queue const&)
+		{
+		}
+	}
+
+	messaging::sender get_sender()
+	{
+		return incoming;
+	}
+};
+
+// 人机交互状态机
+class interface_machine
+{
+	messaging::receiver incoming;
+	std::mutex iom; // cout锁
+
+public:
+
+	void done()
+	{
+		get_sender().send(messaging::close_queue());
+	}
+
+	void run()
+	{
+		try
+		{
+			for (;;)
+			{
+				incoming.wait()
+					.handle<issue_money>(
+						[&](issue_money const& msg)
+				{
+					// 放款显示
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Issuing "
+							<< msg.amount << std::endl;
+					}
+				}
+						)
+					.handle<display_insufficient_funds>(
+						[&](display_insufficient_funds const& msg)
+				{
+					// 余额不足提示
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Insufficient funds" << std::endl;
+					}
+				}
+						)
+					.handle<display_enter_pin>(
+						[&](display_enter_pin const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout
+							<< "Please enter your PIN (0-9)"
+							<< std::endl;
+					}
+				}
+						)
+					.handle<display_enter_card>(
+						[&](display_enter_card const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Please enter your card (I)"
+							<< std::endl;
+					}
+				}
+						)
+					.handle<display_balance>(
+						[&](display_balance const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout
+							<< "The balance of your account is "
+							<< msg.amount << std::endl;
+					}
+				}
+						)
+					.handle<display_withdrawal_options>(
+						[&](display_withdrawal_options const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Withdraw 50? (w)" << std::endl;
+						std::cout << "Display Balance? (b)"
+							<< std::endl;
+						std::cout << "Cancel? (c)" << std::endl;
+					}
+				}
+						)
+					.handle<display_withdrawal_cancelled>(
+						[&](display_withdrawal_cancelled const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Withdrawal cancelled"
+							<< std::endl;
+					}
+				}
+						)
+					.handle<display_pin_incorrect_message>(
+						[&](display_pin_incorrect_message const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "PIN incorrect" << std::endl;
+					}
+				}
+						)
+					.handle<eject_card>(
+						[&](eject_card const& msg)
+				{
+					{
+						std::lock_guard<std::mutex> lk(iom);
+						std::cout << "Ejecting card" << std::endl;
+					}
+				}
+				);
+			}
+		}
+		catch (messaging::close_queue&)
+		{
+		}
+	}
+
+	messaging::sender get_sender()
+	{
+		return incoming;
+	}
+};
+
+#endif // _ATM_H_
+```
+
+<h4 id="source_main_cpp">main.cpp</h4>
+
+```c++
+#include <thread>
+#include "ATM.h"
+
+int main()
+{
+	bank_machine bank;
+	interface_machine interface_hardware;
+	atm machine(bank.get_sender(), interface_hardware.get_sender());
+
+	std::thread bank_thread(&bank_machine::run, &bank);
+	std::thread if_thread(&interface_machine::run, &interface_hardware);
+	std::thread atm_thread(&atm::run, &machine);
+
+	messaging::sender atmqueue(machine.get_sender());
+
+	bool quit_pressed = false;
+	while (!quit_pressed)
+	{
+		char c = getchar();
+		switch (c)
+		{
+		case '0':
+		case '1':
+		case '2':
+		case '3':
+		case '4':
+		case '5':
+		case '6':
+		case '7':
+		case '8':
+		case '9':
+			atmqueue.send(digit_pressed(c));
+			break;
+		case 'b':
+			atmqueue.send(balance_pressed());
+			break;
+		case 'w':
+			atmqueue.send(withdraw_pressed(50));
+			break;
+		case 'c':
+			atmqueue.send(cancel_pressed());
+			break;
+		case 'q':
+			quit_pressed = true;
+			break;
+		case 'i':
+			atmqueue.send(card_inserted("acc1234"));
+			break;
+		}
+	}
+
+	bank.done();
+	machine.done();
+	interface_hardware.done();
+
+	atm_thread.join();
+	bank_thread.join();
+	if_thread.join();
+}
+```
+
+<h4 id="atm_result">结果</h4>
+
+```text
+Please enter your card (I)
+i
+Please enter your PIN (0-9)
+1937
+Withdraw 50? (w)
+Display Balance? (b)
+Cancel? (c)
+b
+The balance of your account is 199
+Withdraw 50? (w)
+Display Balance? (b)
+Cancel? (c)
+w
+Issuing 50
+Withdraw 50? (w)
+Display Balance? (b)
+Cancel? (c)
+b
+The balance of your account is 149
+Withdraw 50? (w)
+Display Balance? (b)
+Cancel? (c)
+c
+Ejecting card
+Please enter your card (I)
+^C
+```
