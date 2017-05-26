@@ -23,6 +23,9 @@ tags:
 	*	[标准整型原子类型](#standard_atomic_integral_type)
 	*	[std::atomic 模板](#std_atomic_template)
 	*	[原子类型的非成员函数](#nonmember_funtions_on_atomic_types)
+*	[同步操作与强制顺序](#synchronize_operations_and_enforce_order)
+	*	[synchronizes-with,happen-before](#synchronize_with_and_happen_before)
+	*	[原子操作内存顺序(memory order)](#memory_order_for_atomic_operations)
 
 <h2 id="the_c_plus_plus_memory_model_and_atomic_operation">C++ 内存模型和原子操作</h2>
 
@@ -312,5 +315,289 @@ std::atomic 模板的存在使得用户可以创建自己的原子类型。要�
 
 **用户定义的原子类型只能使用`load()`、`store()`、`exchange()`、`compare_exchange_weak()`、`compare_exchange_strong()`、以及和自定义类型实例的赋值和转换操作**。
 
+**原子类型能使用的操作**：
+
+operation | `atomic_flag` | `atomic<bool>` | `atomic<T*>` | `atomic<integral type>` | `atomic<other type>`
+----------|---------------|----------------|--------------|-------------------------|-------------------------
+`test_and_set` | √ | | | | 
+`clear` | √ | | | | 
+`is_lock_free` | | √ | √ | √ | √
+`load` | | √ | √ | √ | √
+`store` | | √ | √ | √ | √
+`exchange` | | √ | √ | √ | √
+`compare_exchange_weak` <br> `compare_exchange_strong` | | √ | √ | √ | √
+`fetch_add, +=` | | | √ | √ | 
+`fetch_sub, -=` | | | √ | √ | 
+`fetch_or, |=` | | | | √ | 
+`fetch_and, &=` | | | | √ | 
+`fetch_xor, ^=` | | | | √ | 
+`++, --` | | | √ | √ | 
+
 <h3 id="nonmember_funtions_on_atomic_types">原子类型的非成员函数</h3>
 
+不同的原子类型也有相同的非成员函数存在：
+
+*	大多数非成员函数相对于相应的成员函数，只是多了`atomic_`前缀；
+*	带有`_explicit`后缀的可以指定内存顺序(memory order)，如`std::atomic_store_explicit(&atomic_var,new_value,std::memory_order_release)`；
+*	由于成员函数拥有原子对象的隐式引用，所以**非成员函数第一个参数都是原子对象的指针**。
+
+查找visual studio 2017的源代码：
+
+```c++
+// GENERAL OPERATIONS ON ATOMIC TYPES (FORWARD DECLARATIONS)
+template <class _Ty>
+	struct atomic;
+template <class _Ty>
+	bool atomic_is_lock_free(const volatile atomic<_Ty> *) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_is_lock_free(const atomic<_Ty> *) _NOEXCEPT;
+template <class _Ty>
+	void atomic_init(volatile atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	void atomic_init(atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	void atomic_store(volatile atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	void atomic_store(atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	void atomic_store_explicit(volatile atomic<_Ty> *, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	void atomic_store_explicit(atomic<_Ty> *, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_load(const volatile atomic<_Ty> *) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_load(const atomic<_Ty> *) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_load_explicit(const volatile atomic<_Ty> *,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_load_explicit(const atomic<_Ty> *,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_exchange(volatile atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_exchange(atomic<_Ty> *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_exchange_explicit(volatile atomic<_Ty> *, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_exchange_explicit(atomic<_Ty> *, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_weak(volatile atomic<_Ty> *,
+		_Ty *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_weak(atomic<_Ty> *,
+		_Ty *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_weak_explicit(
+		volatile atomic<_Ty> *, _Ty *, _Ty,
+			memory_order, memory_order) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_weak_explicit(
+		atomic<_Ty> *, _Ty *, _Ty,
+			memory_order, memory_order) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_strong(volatile atomic<_Ty> *,
+		_Ty *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_strong(atomic<_Ty> *,
+		_Ty *, _Ty) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_strong_explicit(
+		volatile atomic<_Ty> *, _Ty *, _Ty,
+			memory_order, memory_order) _NOEXCEPT;
+template <class _Ty>
+	bool atomic_compare_exchange_strong_explicit(
+		atomic<_Ty> *, _Ty *, _Ty,
+			memory_order, memory_order) _NOEXCEPT;
+
+		// TEMPLATED OPERATIONS ON ATOMIC TYPES (DECLARED BUT NOT DEFINED)
+template <class _Ty>
+	_Ty atomic_fetch_add(volatile atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_add(atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_add_explicit(volatile atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_add_explicit(atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_sub(volatile atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_sub(atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_sub_explicit(volatile atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_sub_explicit(atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_and(volatile atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_and(atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_and_explicit(volatile atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_and_explicit(atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_or(volatile atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_or(atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_or_explicit(volatile atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_or_explicit(atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_xor(volatile atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_xor(atomic<_Ty>*, _Ty) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_xor_explicit(volatile atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+template <class _Ty>
+	_Ty atomic_fetch_xor_explicit(atomic<_Ty>*, _Ty,
+		memory_order) _NOEXCEPT;
+```
+
+`std::atomic_flag`的非成员函数名与上面有些不同：
+
+```c++
+inline bool atomic_flag_test_and_set(volatile atomic_flag *_Flag) _NOEXCEPT
+	{	// atomically set *_Flag to true and return previous value
+	return (_Atomic_flag_test_and_set(&_Flag->_My_flag, memory_order_seq_cst));
+	}
+
+inline bool atomic_flag_test_and_set(atomic_flag *_Flag) _NOEXCEPT
+	{	// atomically set *_Flag to true and return previous value
+	return (_Atomic_flag_test_and_set(&_Flag->_My_flag, memory_order_seq_cst));
+	}
+
+inline bool atomic_flag_test_and_set_explicit(
+	volatile atomic_flag *_Flag, memory_order _Order) _NOEXCEPT
+	{	// atomically set *_Flag to true and return previous value
+	return (_Atomic_flag_test_and_set(&_Flag->_My_flag, _Order));
+	}
+
+inline bool atomic_flag_test_and_set_explicit(
+	atomic_flag *_Flag, memory_order _Order) _NOEXCEPT
+	{	// atomically set *_Flag to true and return previous value
+	return (_Atomic_flag_test_and_set(&_Flag->_My_flag, _Order));
+	}
+
+inline void atomic_flag_clear(volatile atomic_flag *_Flag) _NOEXCEPT
+	{	// atomically clear *_Flag
+	_Atomic_flag_clear(&_Flag->_My_flag, memory_order_seq_cst);
+	}
+
+inline void atomic_flag_clear(atomic_flag *_Flag) _NOEXCEPT
+	{	// atomically clear *_Flag
+	_Atomic_flag_clear(&_Flag->_My_flag, memory_order_seq_cst);
+	}
+
+inline void atomic_flag_clear_explicit(
+	volatile atomic_flag *_Flag, memory_order _Order) _NOEXCEPT
+	{	// atomically clear *_Flag
+	_Atomic_flag_clear(&_Flag->_My_flag, _Order);
+	}
+
+inline void atomic_flag_clear_explicit(
+	atomic_flag *_Flag, memory_order _Order) _NOEXCEPT
+	{	// atomically clear *_Flag
+	_Atomic_flag_clear(&_Flag->_My_flag, _Order);
+	}
+```
+
+C++ 标准库也提供了**以原子的方式访问`std::shared_ptr<>`实例的非成员函数**，这打破了只有原子类型才能使用原子操作的原则，因为`std::shared_ptr<>`决然不是原子类型。但C++标准委员会觉得提供这些额外的函数很重要，支持的原子操作有：load、store、exchange、compare/exchange，这些操作作为标准原子类型相同操作的重载，**使用`std::shared_ptr<>*`当做第一个参数，并且根据是否带有`_explicit`后缀决定是否可以指定内存顺序(memory order)，还可以使用`std::atomic_is_lock_free(shared_ptr<> *)`确认实现是否使用了内部锁**。
+
+```c++
+std::shared_ptr<my_data> p;
+void update_global_data()
+{
+	std::shared_ptr<my_data> local(new my_data);
+	std::atomic_store(&p, local);
+}
+void process_global_data()
+{
+	std::shared_ptr<my_data> local = std::atomic_load(&p);
+	process_data(local);
+}
+```
+
+<h2 id="synchronize_operations_and_enforce_order">同步操作与强制顺序</h2>
+
+```c++
+// 在不同的线程中读写变量
+#include <vector>
+#include <atomic>
+#include <thread>
+#include <iostream>
+
+std::vector<int> data;
+std::atomic<bool> data_ready(false);
+void reader_thread()
+{
+	while (!data_ready.load())
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	std::cout << "The answer = " << data[0] << "\n";
+}
+void writer_thread()
+{
+	data.push_back(42);
+	data_ready = true;
+}
+```
+
+忽略循环等待的低效率，上面的程序保证了数据的写入在`data_ready`置位之前，数据的读取在`data_ready`的置位之后，所以保证了数据的读取在写入之后。这看起来好像是理所当然的，但是原子操作还有其它的顺序选项。
+
+<h3 id="synchronize_with_and_happen_before">synchronizes-with,happen-before</h3>
+
+**有两个非常重要的关系类型：同步(synchronizes-with)、发生在之前(happen-before)**。
+
+*	同步(synchronizes-with)：一个变量X的适当标记了的原子写操作W，如果同步到一个对X的适当标记了的原子读操作，那么该读操作读取到的值一定是W写入的值；默然情况下，所有原子类型都被适当标记过，所以你可以认为：当一个线程写数据，一个线程读数据时，就会发生同步(synchronizes-with)关系；
+*	发生在之前(happen-before)：在单线程中，如果一条语句在另一条之前，那么这条语句发生在另一条之前；但如果两个操作发生在同一条语句中，那么这两个操作的顺序根据编译器的不同是不确定的。多线程中，如果一个线程中的操作A比另一个线程中的操作B先发生，那么称A线程间发生在B之前(inter-thread happens-before)。
+
+**当一个线程中的操作A同步到(synchronizes-with)另一个线程中的操作B时，那么A线程间发生在B之前(inter-thread happens-before)**。
+
+```c++
+#include <iostream>
+#include <cstdlib>
+
+void foo(int a, int b)
+{
+	std::cout << a << ", " << b << std::endl;
+}
+int get_num()
+{
+	static int i = 0;
+	return ++i;
+}
+
+int main()
+{
+	// get_num()的调用顺序是不确定的
+	foo(get_num(), get_num());
+
+	getchar();
+	return EXIT_SUCCESS;
+}
+```
+
+<h3 id="memory_order_for_atomic_operations">原子操作内存顺序(memory order)</h3>
+
+**原子类型操作有六个可选的内存顺序(memory order)选项**：`memory_order_relaxed`,`memory_order_consume`,`memory_order_acquire`,`memory_order_release`,`memory_order_acq_rel`,`memory_order_seq_cst`，**所有操作的默认内存顺序(memory order)都是`memory_order_seq_cst`**。它们被分成三个模型：
+
+*	序列一致(sequentially consistent)顺序：`memory_order_seq_cst`；
+*	获取释放(acquire-release)顺序：`memory_order_consume`,`memory_order_acquire`,`memory_order_release`,`memory_order_acq_rel`；
+*	自由(relaxed)顺序：`memory_order_relaxed`。
+
+这些模型在不同CPU架构下的功耗是不同的，如何选择需要了解它们是怎样影响程序的行为的。
