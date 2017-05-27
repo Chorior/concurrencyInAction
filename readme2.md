@@ -601,3 +601,7 @@ int main()
 *	自由(relaxed)顺序：`memory_order_relaxed`。
 
 这些模型在不同CPU架构下的功耗是不同的，如何选择需要了解它们是怎样影响程序的行为的。
+
+#### 序列一致(sequentially consistent)顺序
+
+如果所有原子类型的实例的操作都是序列一致(sequentially consistent)的，那么多线程的行为就像所有这些操作以一定的顺序在单线程中运行一样，这就是为什么它是默认内存顺序(memory order)的原因。
