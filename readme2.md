@@ -604,4 +604,219 @@ int main()
 
 #### 序列一致(sequentially consistent)顺序
 
-如果所有原子类型的实例的操作都是序列一致(sequentially consistent)的，那么多线程的行为就像所有这些操作以一定的顺序在单线程中运行一样，这就是为什么它是默认内存顺序(memory order)的原因。
+如果所有原子类型的实例的操作都是序列一致(sequentially consistent)的，那么多线程的行为就像所有这些操作以一定的顺序在单线程中运行一样，这就是为什么它是默认内存顺序(memory order)的原因。**你必须对所有线程使用序列一致(sequentially consistent)，才能获得这一特点**。
+
+**序列一致(sequentially consistent)是最简单、最直观的排序，但是由于其需要对所有线程进行全局同步，所以它也是最昂贵的内存排序(memory order)**。在一个多处理器系统上，使用序列一致(sequentially consistent)可能会导致处理器间进行大量且耗时的通信工作。
+
+```c++
+// 一个使用序列一致(sequentially consistent)的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<bool> x, y;
+std::atomic<int> z;
+
+void write_x()
+{
+	x.store(true, std::memory_order_seq_cst);
+}
+void write_y()
+{
+	y.store(true, std::memory_order_seq_cst);
+}
+void read_x_then_y()
+{
+	while (!x.load(std::memory_order_seq_cst));
+	if (y.load(std::memory_order_seq_cst))
+		++z;
+}
+void read_y_then_x()
+{
+	while (!y.load(std::memory_order_seq_cst));
+	if (x.load(std::memory_order_seq_cst))
+		++z;
+}
+
+int main()
+{
+	x = false;
+	y = false;
+	z = 0;
+	std::thread a(write_x);
+	std::thread b(write_y);
+	std::thread c(read_x_then_y);
+	std::thread d(read_y_then_x);
+	a.join();
+	b.join();
+	c.join();
+	d.join();
+	assert(z.load() != 0);
+}
+```
+
+上面的示例中，assert永远不会造成中断，其运行情况可以分为三种：
+
+*	如果`x.store`发生在`y.store`之前，且`read_x_then_y`的`y.load`发生在`y.store`之前，那么由于`read_y_then_x`中`x.load`一定是发生在`y.store`之后，所以`x.load`一定发生在`x.store`之后，所以`x.load`一定返回true，导致z递增加一；
+*	上面情况的对称；
+*	不管`x.store`和`y.store`谁先发生，如果`read`都发生在`write`之后，那么z会递增两次；
+
+#### 非序列一致(non-sequentially consistent memory)顺序
+
+一旦跨出序列一致(sequentially consistent)的世界，事情就开始变得复杂起来。**其中最大的问题就是：再也没有一个单一的全局的事件顺序了(there’s no longer a single global order of events)**。这意味着：**即使是同一个操作，不同的线程也将看到不同的视界(different views)，你必须将不同线程中操作的精神模型(mental model)整洁的交错在一起**。
+
+**不仅你必须确保事件是真正并发的，并且线程并不需要去遵守事件的顺序(Not only do you have to account for things happening truly concurrently, but threads don’t have to agree on the order of events)**。即使不同线程跑的是同一段代码，由于不同CPU缓存和内部缓冲区在同一个内存区里面可以存储不同的值，导致不同线程的操作缺少了严格的顺序限制。
+
+**在没有其他排序限制的情况下，唯一的要求是：所有线程都必须遵守每个变量的修改顺序(modification order)**。不同变量的操作在不同线程中可以呈现出不同的顺序，只要所观察到的值与施加的任何排序约束一致。
+
+#### 自由(relaxed)顺序
+
+**使用自由(relaxed)顺序的原子操作没有同步(synchronizes-with)关系**。单一线程中**同一变量**的操作依然遵守发生在之前(happen-before)关系，但是线程间几乎不需要相对顺序。唯一的要求是：**同一线程中对同一个原子变量的访问不能被重新排序**。一旦给定的线程已经看到一个原子变量的特定的值，那么该线程随后的读操作就不能获取该变量更早的值了。
+
+**在没有附加同步操作的情况下，使用`memory_order_relaxed`时线程间共享的唯一东西就是：每个变量的修改顺序(modification order)**。
+
+```c++
+// 一个使用自由(relaxed)顺序的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<bool> x, y;
+std::atomic<int> z;
+
+void write_x_then_y()
+{
+	x.store(true, std::memory_order_relaxed);
+	y.store(true, std::memory_order_relaxed);
+}
+void read_y_then_x()
+{
+	while (!y.load(std::memory_order_relaxed));
+	if (x.load(std::memory_order_relaxed))
+		++z;
+}
+
+int main()
+{
+	x = false;
+	y = false;
+	z = 0;
+	std::thread a(write_x_then_y);
+	std::thread b(read_y_then_x);
+	a.join();
+	b.join();
+	assert(z.load() != 0);
+}
+```
+
+上面的示例中，assert可能发生中断：根据自由(relaxed)顺序只支持同一变量在同一线程中的发生在之前(happen-before)关系，得出x、y的store、load之间都是没有发生的先后关系的；根据自由(relaxed)顺序并不支持同步(synchronizes-with)关系，得出x、y的store和load之间也没有先后关系；最后根据以上两点，得出：`x.load`可能发生在`x.store`之前，所以z可能为0。
+
+```c++
+// 一个使用自由(relaxed)顺序的复杂例子
+#include <thread>
+#include <atomic>
+#include <iostream>
+
+std::atomic<int> x(0), y(0), z(0);
+std::atomic<bool> go(false);
+
+unsigned const loop_count = 10;
+
+struct read_values
+{
+	int x, y, z;
+};
+
+read_values values1[loop_count];
+read_values values2[loop_count];
+read_values values3[loop_count];
+read_values values4[loop_count];
+read_values values5[loop_count];
+
+void increment(std::atomic<int>* var_to_inc, read_values* values)
+{
+	while (!go)
+		std::this_thread::yield();
+	for (unsigned i = 0; i<loop_count; ++i)
+	{
+		values[i].x = x.load(std::memory_order_relaxed);
+		values[i].y = y.load(std::memory_order_relaxed);
+		values[i].z = z.load(std::memory_order_relaxed);
+		var_to_inc->store(i + 1, std::memory_order_relaxed);
+		std::this_thread::yield();
+	}
+}
+
+void read_vals(read_values* values)
+{
+	while (!go)
+		std::this_thread::yield();
+	for (unsigned i = 0; i<loop_count; ++i)
+	{
+		values[i].x = x.load(std::memory_order_relaxed);
+		values[i].y = y.load(std::memory_order_relaxed);
+		values[i].z = z.load(std::memory_order_relaxed);
+		std::this_thread::yield();
+	}
+}
+
+void print(read_values* v)
+{
+	for (unsigned i = 0; i<loop_count; ++i)
+	{
+		if (i)
+			std::cout << ",";
+		std::cout << "(" << v[i].x << "," << v[i].y << "," << v[i].z << ")";
+	}
+	std::cout << std::endl;
+}
+
+int main()
+{
+	std::thread t1(increment, &x, values1);
+	std::thread t2(increment, &y, values2);
+	std::thread t3(increment, &z, values3);
+	std::thread t4(read_vals, values4);
+	std::thread t5(read_vals, values5);
+
+	go = true; // 确保线程几乎同时开始循环
+
+	t5.join();
+	t4.join();
+	t3.join();
+	t2.join();
+	t1.join();
+
+	print(values1);
+	print(values2);
+	print(values3);
+	print(values4);
+	print(values5);
+}
+```
+
+上面代码运行起来稍微有些复杂，
+
+*	首先还是从主函数开始看：主函数开了五个线程，其中三个线程除了读取全局原子变量之外，还对传入的原子参数进行了更新操作，然后是两个对原子变量只读线程，在所有线程完成之后，对所有赋值后的结构体数组变量进行打印操作；
+*	再来看三个进行过原子更新操作的线程：根据自由(relaxed)顺序支持同一变量在同一线程中的发生在之前(happen-before)关系，所以线程t1对x的操作是有先后关系的，即load->store->load->...->store，t2、t3类似，所以values1所有元素的x成员、values2所有元素的y成员、values3所有元素的z成员一定是0123456789；
+*	最后根据自由(relaxed)顺序并不支持同步(synchronizes-with)关系，所以所有线程对各个原子变量操作的相对顺序并没有保证，所以其它值将是0~10之间的任意值，但是因为单一原子变量的load是有先后关系的，所以values同一位置的值将会呈现不严格递增(大于等于)趋势。
+
+一种visual studio 2017的结果是：
+
+```text
+(0,4,4),(1,7,7),(2,10,10),(3,10,10),(4,10,10),(5,10,10),(6,10,10),(7,10,10),(8,10,10),(9,10,10)
+(0,0,0),(0,1,1),(0,2,2),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8),(2,9,9)
+(0,0,0),(0,1,1),(0,2,2),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8),(2,9,9)
+(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10),(10,10,10)
+(0,3,3),(1,6,6),(2,8,8),(3,10,10),(4,10,10),(5,10,10),(6,10,10),(7,10,10),(8,10,10),(9,10,10)
+```
+
+再次运行：
+
+```text
+(0,4,4),(1,7,7),(2,9,10),(3,10,10),(4,10,10),(5,10,10),(6,10,10),(7,10,10),(8,10,10),(9,10,10)
+(0,0,0),(0,1,1),(0,2,2),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8),(2,9,9)
+(0,0,0),(0,1,1),(0,2,2),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8),(2,9,9)
+(0,0,0),(0,1,1),(0,2,2),(0,2,3),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8)
+(0,3,3),(1,6,6),(2,8,8),(3,10,10),(4,10,10),(5,10,10),(6,10,10),(7,10,10),(8,10,10),(9,10,10)
+```
