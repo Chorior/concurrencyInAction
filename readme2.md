@@ -709,7 +709,7 @@ int main()
 }
 ```
 
-上面的示例中，assert可能发生中断：根据自由(relaxed)顺序只支持同一变量在同一线程中的发生在之前(happen-before)关系，得出x、y的store、load之间都是没有发生的先后关系的；根据自由(relaxed)顺序并不支持同步(synchronizes-with)关系，得出x、y的store和load之间也没有先后关系；最后根据以上两点，得出：`x.load`可能发生在`x.store`之前，所以z可能为0。
+上面的示例中，assert可能发生中断：根据自由(relaxed)顺序只支持同一变量在同一线程中的发生在之前(happen-before)关系，得出x、y的store之间是没有发生的先后关系的；根据自由(relaxed)顺序并不支持同步(synchronizes-with)关系，得出x、y的store和load之间也没有先后关系；最后根据以上两点，得出：`x.load`可能发生在`x.store`之前，所以z可能为0。
 
 ```c++
 // 一个使用自由(relaxed)顺序的复杂例子
@@ -820,3 +820,286 @@ int main()
 (0,0,0),(0,1,1),(0,2,2),(0,2,3),(0,3,3),(0,4,4),(1,5,5),(1,6,6),(1,7,7),(2,8,8)
 (0,3,3),(1,6,6),(2,8,8),(3,10,10),(4,10,10),(5,10,10),(6,10,10),(7,10,10),(8,10,10),(9,10,10)
 ```
+
+**自由原子操作非常难处理，除非特别必要，不要使用自由(relaxed)顺序**。
+
+#### 获取-释放(acquire-release)顺序
+
+获取-释放(acquire-release)顺序是自由(relaxed)顺序的加强版，所有操作仍然没有统一的排序，但是它加入了一些同步。在这种顺序模型下，**原子加载(load)是获取(acquire)操作(memory_order_acquire)，原子存储(store)是释放(release)操作(memory_order_release)，原子读改写(read-modify-write)是获取(acquire)、释放(release)、或者两者都有的操作(memory_order_acq_rel)**。
+
+**同步是成对的，一个线程获取(acquire)，一个线程释放(release)**。一个释放(release)操作同步到(synchronizes-with)一个获取操作，即释放操作发生在获取操作之前，根据上面的知识，即store发生在load之前。这意味着：不同线程仍然可以看到不同的顺序，但这些顺序是有限制的。
+
+```c++
+// 一个使用获取-释放(acquire-release)顺序的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<bool> x, y;
+std::atomic<int> z;
+
+void write_x()
+{
+	x.store(true, std::memory_order_release);
+}
+void write_y()
+{
+	y.store(true, std::memory_order_release);
+}
+void read_x_then_y()
+{
+	while (!x.load(std::memory_order_acquire));
+	if (y.load(std::memory_order_acquire))
+		++z;
+}
+void read_y_then_x()
+{
+	while (!y.load(std::memory_order_acquire));
+	if (x.load(std::memory_order_acquire))
+		++z;
+}
+
+int main()
+{
+	x = false;
+	y = false;
+	z = 0;
+	std::thread a(write_x);
+	std::thread b(write_y);
+	std::thread c(read_x_then_y);
+	std::thread d(read_y_then_x);
+	a.join();
+	b.join();
+	c.join();
+	d.join();
+	assert(z.load() != 0);
+}
+```
+
+上面的示例中，assert可能发生中断。主函数开了四个线程，其中两个写，两个读；根据获取-释放(acquire-release)顺序的release和acquire是同步的，所以线程`read_x_then_y`中`x.load`一定发生在`x.store`之后，但`y.load`是不是发生在`y.store`之后就不一定了；同理，线程`read_y_then_x`中`x.load`也不一定发生在`y.store`之后；所以当线程c和d看到线程a和b的不同相对顺序时，z不会发生改变。
+
+```c++
+// 一个体现获取-释放(acquire-release)顺序优点的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<bool> x, y;
+std::atomic<int> z;
+
+void write_x_then_y()
+{
+	x.store(true, std::memory_order_relaxed);
+	y.store(true, std::memory_order_release);
+}
+void read_y_then_x()
+{
+	while (!y.load(std::memory_order_acquire));
+	if (x.load(std::memory_order_relaxed))
+		++z;
+}
+
+int main()
+{
+	x = false;
+	y = false;
+	z = 0;
+	std::thread a(write_x_then_y);
+	std::thread b(read_y_then_x);
+	a.join();
+	b.join();
+	assert(z.load() != 0);
+}
+```
+
+上面的示例中，assert永远不会发生中断。根据获取-释放(acquire-release)顺序的release和acquire是同步的，所以`y.load`一定发生在`y.store`之前，**`memory_order_acquire`保证在`memory_order_release`之前的所有修改(原子的、非原子的)都能被其看见**，所以`x.load`一定发生在`x.store`之后，所以z一定会递增。但如果`y.load`不是在循环里，结果就会不同。
+
+```c++
+// memory_order_acquire保证在memory_order_release之前的所有修改都能被其看见
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<int> data[5];
+std::atomic<bool> sync1(false), sync2(false);
+
+void thread_1()
+{
+	data[0].store(42, std::memory_order_relaxed);
+	data[1].store(97, std::memory_order_relaxed);
+	data[2].store(17, std::memory_order_relaxed);
+	data[3].store(-141, std::memory_order_relaxed);
+	data[4].store(2003, std::memory_order_relaxed);
+	sync1.store(true, std::memory_order_release);
+}
+void thread_2()
+{
+	while (!sync1.load(std::memory_order_acquire));
+	sync2.store(true, std::memory_order_release);
+}
+void thread_3()
+{
+	while (!sync2.load(std::memory_order_acquire));
+	assert(data[0].load(std::memory_order_relaxed) == 42);
+	assert(data[1].load(std::memory_order_relaxed) == 97);
+	assert(data[2].load(std::memory_order_relaxed) == 17);
+	assert(data[3].load(std::memory_order_relaxed) == -141);
+	assert(data[4].load(std::memory_order_relaxed) == 2003);
+}
+
+int main()
+{
+	std::thread t1(thread_1);
+	std::thread t2(thread_2);
+	std::thread t3(thread_3);
+
+	t1.join();
+	t2.join();
+	t3.join();
+}
+```
+
+上面的示例中，`thread_2`作为中间线程，使得`thread_1`与`thread_3`进行了同步。为了验证`memory_order_release`之后的修改是否能被`memory_order_acquire`看见，修改上面程序，添加一个额外的int全局变量test，在`memory_order_release`之后改变它的值，为了确保验证的正确性，添加一个一秒的延时：
+
+```c++
+// memory_order_release之后的修改并不一定能被memory_order_acquire看见
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<int> data[5];
+std::atomic<bool> sync1(false), sync2(false);
+
+int test{ 0 };
+
+void thread_1()
+{
+	data[0].store(42, std::memory_order_relaxed);
+	data[1].store(97, std::memory_order_relaxed);
+	data[2].store(17, std::memory_order_relaxed);
+	data[3].store(-141, std::memory_order_relaxed);
+	data[4].store(2003, std::memory_order_relaxed);
+	sync1.store(true, std::memory_order_release);
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+	test = 233;
+}
+void thread_2()
+{
+	while (!sync1.load(std::memory_order_acquire));
+	sync2.store(true, std::memory_order_release);
+}
+void thread_3()
+{
+	while (!sync2.load(std::memory_order_acquire));
+	assert(data[0].load(std::memory_order_relaxed) == 42);
+	assert(data[1].load(std::memory_order_relaxed) == 97);
+	assert(data[2].load(std::memory_order_relaxed) == 17);
+	assert(data[3].load(std::memory_order_relaxed) == -141);
+	assert(data[4].load(std::memory_order_relaxed) == 2003);
+
+	assert(test == 233); // fire
+}
+
+int main()
+{
+	std::thread t1(thread_1);
+	std::thread t2(thread_2);
+	std::thread t3(thread_3);
+
+	t1.join();
+	t2.join();
+	t3.join();
+}
+```
+
+你也可以使用读改写(read-modify-write)操作来实现上上个示例：
+
+```c++
+std::atomic<int> sync(0);
+void thread_1()
+{
+	// ...
+	sync.store(1, std::memory_order_release);
+}
+void thread_2()
+{
+	int expected = 1;
+	while (!sync.compare_exchange_strong(expected, 2,
+		std::memory_order_acq_rel))
+		expected = 1;
+}
+void thread_3()
+{
+	while (sync.load(std::memory_order_acquire)<2);
+	// ...
+}
+```
+
+**如果你确认不需要严格的序列一致(sequentially consistent)顺序，使用获取-释放(require-release)顺序是个不错的选择**。
+
+#### memory_order_consume
+
+`memory_order_consume`是获取-释放(require-release)顺序模型的一部分。它很特别：它完全依赖于数据。
+
+这里有两种新的数据依赖关系：
+
+*	携带依赖(carries-a-dependency-to)：如果操作A的结果被用作操作B的操作数，则A携带依赖于(carries-a-dependency-to)B。该关系具有传递性。
+*	前序依赖(dependency-ordered-before)：该关系以标记为`memory_order_consume`的原子加载(load)操作进行引入，它是`memory_order_acquire`的一个特例；一个标记为`memory_order_release`、`memory_order_acq_rel`或`memory_order_seq_cst`的存储(store)操作A前序依赖于一个标记为`memory_order_consume`的加载(load)操作B，如果B读取的是A存储(store)的值的话。**如果A前序依赖于(dependency-ordered-before)B，那么A线程间发生在B之前(inter-thread happens-before)**。
+
+```c++
+// 一个使用memory_order_consume的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+struct X
+{
+	int i;
+	std::string s;
+};
+
+std::atomic<X*> p;
+std::atomic<int> a;
+
+void create_x()
+{
+	X* x = new X;
+	x->i = 42;
+	x->s = "hello";
+	a.store(99, std::memory_order_relaxed);
+	p.store(x, std::memory_order_release);
+}
+void use_x()
+{
+	X* x;
+	while (!(x = p.load(std::memory_order_consume)))
+		std::this_thread::yield();
+	assert(x->i == 42);
+	assert(x->s == "hello"); 
+	assert(a.load(std::memory_order_relaxed) == 99);
+}
+
+int main()
+{
+	std::thread t1(create_x);
+	std::thread t2(use_x);
+	t1.join();
+	t2.join();
+}
+```
+
+上面的示例中，x的值前序依赖于(dependency-ordered-before)p，所以x的值一定是`p.store`存储的值，所以关于x的断言(assert)永远不会发生中断；但是a的断言(assert)并不依赖于p的值，所以它可能发生中断。
+
+当一个值并不携带依赖于(carries-a-dependency-to)`memory_order_consume`加载(load)的值时，使用`std::kill_dependency`可以让编译器有更大的空间进行优化，搞不清楚就去[SOF](https://stackoverflow.com/questions/7150395/what-does-stdkill-dependency-do-and-why-would-i-want-to-use-it)看看，但是我觉得并没有必要使用这个东西：
+
+```c++
+int global_data[] = { ... };
+std::atomic<int> index;
+void f()
+{
+	int i = index.load(std::memory_order_consume);
+	do_something_with(global_data[std::kill_dependency(i)]);
+}
+```
+
