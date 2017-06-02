@@ -23,9 +23,11 @@ tags:
 	*	[标准整型原子类型](#standard_atomic_integral_type)
 	*	[std::atomic 模板](#std_atomic_template)
 	*	[原子类型的非成员函数](#nonmember_funtions_on_atomic_types)
-*	[同步操作与强制顺序](#synchronize_operations_and_enforce_order)
+	*	[同步操作与强制顺序](#synchronize_operations_and_enforce_order)
 	*	[synchronizes-with,happen-before](#synchronize_with_and_happen_before)
 	*	[原子操作内存顺序(memory order)](#memory_order_for_atomic_operations)
+	*	[release sequences and synchronizes-with](#release_sequences_and_synchronizes_with)
+	*	[fences](#fences)
 
 <h2 id="the_c_plus_plus_memory_model_and_atomic_operation">C++ 内存模型和原子操作</h2>
 
@@ -563,10 +565,10 @@ void writer_thread()
 
 **有两个非常重要的关系类型：同步(synchronizes-with)、发生在之前(happen-before)**。
 
-*	同步(synchronizes-with)：一个变量X的适当标记了的原子写操作W，如果同步到一个对X的适当标记了的原子读操作，那么该读操作读取到的值一定是W写入的值；默然情况下，所有原子类型都被适当标记过，所以你可以认为：当一个线程写数据，一个线程读数据时，就会发生同步(synchronizes-with)关系；
-*	发生在之前(happen-before)：在单线程中，如果一条语句在另一条之前，那么这条语句发生在另一条之前；但如果两个操作发生在同一条语句中，那么这两个操作的顺序根据编译器的不同是不确定的。多线程中，如果一个线程中的操作A比另一个线程中的操作B先发生，那么称A线程间发生在B之前(inter-thread happens-before)。
+*	synchronizes-with：一个变量X的适当标记了的原子写操作W，如果synchronizes-with一个对X的适当标记了的原子读操作，那么该读操作读取到的值一定是W写入的值；默然情况下，所有原子类型都被适当标记过，所以你可以认为：当一个线程写数据，一个线程读数据时，就会发生synchronizes-with关系；
+*	happens-before：在单线程中，如果一条语句在另一条之前，那么这条语句happens-before另一条；但如果两个操作发生在同一条语句中，那么这两个操作的顺序根据编译器的不同是不确定的。多线程中，如果一个线程中的操作A比另一个线程中的操作B先发生，那么称A inter-thread happens-before B。
 
-**当一个线程中的操作A同步到(synchronizes-with)另一个线程中的操作B时，那么A线程间发生在B之前(inter-thread happens-before)**。
+**当一个线程中的操作A synchronizes-with 另一个线程中的操作B时，那么A inter-thread happens-before B**。
 
 ```c++
 #include <iostream>
@@ -1044,8 +1046,8 @@ void thread_3()
 
 这里有两种新的数据依赖关系：
 
-*	携带依赖(carries-a-dependency-to)：如果操作A的结果被用作操作B的操作数，则A携带依赖于(carries-a-dependency-to)B。该关系具有传递性。
-*	前序依赖(dependency-ordered-before)：该关系以标记为`memory_order_consume`的原子加载(load)操作进行引入，它是`memory_order_acquire`的一个特例；一个标记为`memory_order_release`、`memory_order_acq_rel`或`memory_order_seq_cst`的存储(store)操作A前序依赖于一个标记为`memory_order_consume`的加载(load)操作B，如果B读取的是A存储(store)的值的话。**如果A前序依赖于(dependency-ordered-before)B，那么A线程间发生在B之前(inter-thread happens-before)**。
+*	携带依赖(carries-a-dependency-to)：如果操作A的结果被用作操作B的操作数，则A carries-a-dependency-to B。该关系具有传递性。
+*	前序依赖(dependency-ordered-before)：该关系以标记为`memory_order_consume`的原子加载(load)操作进行引入，它是`memory_order_acquire`的一个特例；一个标记为`memory_order_release`、`memory_order_acq_rel`或`memory_order_seq_cst`的存储(store)操作A前序依赖于一个标记为`memory_order_consume`的加载(load)操作B，如果B读取的是A存储(store)的值的话。**如果A dependency-ordered-before B，那么A inter-thread happens-before B**。
 
 ```c++
 // 一个使用memory_order_consume的简单例子
@@ -1089,9 +1091,9 @@ int main()
 }
 ```
 
-上面的示例中，x的值前序依赖于(dependency-ordered-before)p，所以x的值一定是`p.store`存储的值，所以关于x的断言(assert)永远不会发生中断；但是a的断言(assert)并不依赖于p的值，所以它可能发生中断。
+上面的示例中，x的值 dependency-ordered-before p，所以x的值一定是`p.store`存储的值，所以关于x的断言(assert)永远不会发生中断；但是a的断言(assert)并不依赖于p的值，所以它可能发生中断。
 
-当一个值并不携带依赖于(carries-a-dependency-to)`memory_order_consume`加载(load)的值时，使用`std::kill_dependency`可以让编译器有更大的空间进行优化，搞不清楚就去[SOF](https://stackoverflow.com/questions/7150395/what-does-stdkill-dependency-do-and-why-would-i-want-to-use-it)看看，但是我觉得并没有必要使用这个东西：
+当一个值并不 carries-a-dependency-to `memory_order_consume`加载(load)的值时，使用`std::kill_dependency`可以让编译器有更大的空间进行优化，搞不清楚就去[SOF](https://stackoverflow.com/questions/7150395/what-does-stdkill-dependency-do-and-why-would-i-want-to-use-it)看看，但是我觉得并没有必要使用这个东西：
 
 ```c++
 int global_data[] = { ... };
@@ -1102,4 +1104,140 @@ void f()
 	do_something_with(global_data[std::kill_dependency(i)]);
 }
 ```
+
+<h3 id="release_sequences_and_synchronizes_with">release sequences and synchronizes-with</h3>
+
+如果store以`memory_order_release`、`memory_order_acq_rel`或`memory_order_seq_cst`标记，load以`memory_order_consume`、`memory_order_acquire`或`memory_order_seq_cst`标记，且链上的每一load操作得到的值都是前一store操作写下的值，那么这个操作链组成了一个释放序列(release sequences)，并且初始化store synchronizes-with (对应`memory_order_acquire`和`memory_order_seq_cst`)或 dependency-ordered-before (对应`memory_order_consume`)最终load。该链上任何原子读改写(read-modify-write)操作可以拥有任何内存顺序(memory order)，甚至`memory_order_relaxed`。
+
+```c++
+// 使用原子操作从一个队列中读值
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <iostream>
+
+std::vector<int> queue_data;
+std::atomic<int> count;
+
+void populate_queue()
+{
+	unsigned const number_of_items = 20;
+	queue_data.clear();
+	for (unsigned i = 0; i<number_of_items; ++i)
+	{
+		queue_data.push_back(i);
+	}
+	count.store(number_of_items, std::memory_order_release);
+}
+
+void process(int &i) { ++i; }
+
+void consume_queue_items()
+{
+	while (true)
+	{
+		int item_index;
+		// fetch_sub: 调用值减去参数值，并返回原值
+		if ((item_index = count.fetch_sub(1, std::memory_order_acquire)) <= 0)
+		{
+			std::this_thread::yield();
+			continue;
+		}
+		process(queue_data[item_index - 1]);
+	}
+}
+
+int main()
+{
+	std::thread a(populate_queue);
+	std::thread b(consume_queue_items);
+	std::thread c(consume_queue_items);
+	a.join();
+	b.detach();
+	c.detach();
+
+	for (auto &i : queue_data)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << std::endl;
+}
+```
+
+结果：
+
+```text
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+```
+
+分析：我们知道当consumer只开一个时，由于`memory_order_acquire`会看到`memory_order_release`之前的全部修改，所以代码会工作的很好。但是现在consumer开了两个，那么第二个consumer就可能看到第一个consumer修改后的值，除非第一个`fetch_sub`使用`memory_order_release`，但这会带来不必要的同步；如果没有释放序列(release sequence)规则或者`fetch_sub`没有使用`memory_order_release`的话，没有什么能够要求第二个consumer能够看到`queue_data`的store操作。庆幸的是，`fetch_sub`参与了释放序列(release sequence)，所以store也同步到第二个`fetch_sub`，并且两个consumer也没有进行同步。下面图的实线显示了发生在之前(happens-before)关系，虚线显示了释放序列(release sequence)。
+
+![release sequence](https://raw.githubusercontent.com/xiaoweiChen/Cpp_Concurrency_In_Action/master/images/chapter5/5-7.png)
+
+这里的链可以有任意数量的连接，只要它们都是读改写(read-modify-write)操作，那么store将会同步到每一个标记为`memory_order_acquire`的操作。
+
+<h3 id="fences">fences</h3>
+
+fences是在没有修改数据的情况下强制内存顺序(memory order)限制的操作，典型的是与`memory_order_relaxed`的原子操作一起使用。fences是全局操作，并且会影响线程中执行了fences的原子操作的顺序。fences通常也被称为内存屏障(memory barriers)，因为它们就像在代码中画出了一条某些(certain)操作无法跨越的线一样。
+
+你应该知道，不同变量上的relaxed操作根据编译器或硬件的不同，可以被任意排序，但fences限制了这个自由，并且引入了happens-before和synchronizes-with关系。
+
+```c++
+// 一个使用atomic_thread_fence的简单例子
+#include <atomic>
+#include <thread>
+#include <cassert>
+
+std::atomic<bool> x, y;
+std::atomic<int> z;
+
+void write_x_then_y()
+{
+	x.store(true, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	y.store(true, std::memory_order_relaxed);
+}
+void read_y_then_x()
+{
+	while (!y.load(std::memory_order_relaxed));
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if (x.load(std::memory_order_relaxed))
+		++z;
+}
+
+int main()
+{
+	x = false;
+	y = false;
+	z = 0;
+	std::thread a(write_x_then_y);
+	std::thread b(read_y_then_x);
+	a.join();
+	b.join();
+	assert(z.load() != 0);
+}
+```
+
+上面的assert永远不会发生中断，因为`atomic_thread_fence`使得`x.store`一定发生在`x.load`之前，所以z一定会递增；但是如果没有`atomic_thread_fence`的话，assert可能会发生中断，因为`x.store`与`y.store`没有顺序。
+
+>This is the general idea with fences: if an acquire operation sees the result of a store that takes place after a release fence, the fence synchronizes-with that acquire operation; and if a load that takes place before an acquire fence sees the result of a release operation, the release operation synchronizes-with the acquire fence.
+
+<h2 id="designing_lock_based_concurrent_data_structures">基于锁的并发数据结构设计</h2>
+
+数据结构的选择是编程问题的重要组成部分，并发编程也不例外。如果一个数据结构被多个线程访问，这个数据结构要么是不可变的，要么需要设计程序用以确保改变在线程间是正确同步的。
+
+**并发设计的一条路是使用mutex，另一条路就是设计数据结构自身，用以支持并发访问，这样的数据结构被称为线程安全(thread safe)**。
+
+使用mutex序列化了线程对数据的访问，要想获得真正的并发访问，你必须对数据结构的设计仔细斟酌。**保护区域越少，被序列化的操作就越少，并发访问的潜力就越大**。
+
+在设计数据结构时，你有两方面需要思考：
+
+*	确保访问是安全(safe)的：一个线程在修改数据时，不能被另一个线程看到中间状态；一个完整的操作不要分成几个操作写在不同的函数里；数据结构的异常处理；死锁问题；等等；
+*	启动真正的并发：当前锁范围内的操作是否能移到锁范围外执行？该数据结构的不同部分能否使用不同的mutex来保护？是不是所有操作都需要相同层级的保护？有没有不改变操作语义又能提升并发的概率的简单操作？等等。
+
+<h3 id="simple_lock_based_concurrent_data_structures">基于锁的简单并发数据结构设计</h3>
+
+
+
+
 
