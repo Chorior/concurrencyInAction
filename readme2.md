@@ -28,6 +28,9 @@ tags:
 	*	[原子操作内存顺序(memory order)](#memory_order_for_atomic_operations)
 	*	[release sequences and synchronizes-with](#release_sequences_and_synchronizes_with)
 	*	[fences](#fences)
+*	[基于锁的并发数据结构设计](#designing_lock_based_concurrent_data_structures)
+	*	[基于锁的简单并发数据结构设计](#simple_lock_based_concurrent_data_structures)
+	*	[基于锁的复杂并发数据结构设计](#complex_lock_based_concurrent_data_structures)
 
 <h2 id="the_c_plus_plus_memory_model_and_atomic_operation">C++ 内存模型和原子操作</h2>
 
@@ -1232,12 +1235,708 @@ int main()
 
 在设计数据结构时，你有两方面需要思考：
 
-*	确保访问是安全(safe)的：一个线程在修改数据时，不能被另一个线程看到中间状态；一个完整的操作不要分成几个操作写在不同的函数里；数据结构的异常处理；死锁问题；等等；
-*	启动真正的并发：当前锁范围内的操作是否能移到锁范围外执行？该数据结构的不同部分能否使用不同的mutex来保护？是不是所有操作都需要相同层级的保护？有没有不改变操作语义又能提升并发的概率的简单操作？等等。
+*	确保访问是安全(safe)的：一个线程在修改数据时，不能被另一个线程看到中间状态；一个完整的操作不要分成几个操作写在不同的函数里；数据结构的异常处理；死锁(dead-lock)问题；等等；
+*	启动真正的并发：当前锁范围内的操作是否能移到锁范围外执行？该数据结构的不同部分能否使用不同的mutex来保护？是不是所有操作都需要相同层级的保护？有没有不改变操作语义又能提升并发概率的简单操作？等等。
 
 <h3 id="simple_lock_based_concurrent_data_structures">基于锁的简单并发数据结构设计</h3>
 
+基于锁的并发数据结构设计就是：**确保在访问数据的时候lock了正确的mutex，并且lock的时长最短**。
 
+你需要保证数据不能在保护区域外被访问，且接口(interface)间不能有条件竞争，如果有多个锁的话还要避免死锁的发生。
 
+#### A thread-safe stack using locks
 
+```c++
+#pragma once
 
+// 一个线程安全的简单stack模板
+#include <exception>
+#include <stack>
+#include <mutex>
+
+struct empty_stack : std::exception
+{
+	const char* what() const throw()
+	{
+		return "empty stack.\n";
+	}
+};
+
+template<typename T>
+class threadsafe_stack
+{
+private:
+	std::stack<T> data;
+	mutable std::mutex m;
+
+public:
+	threadsafe_stack() {}
+
+	threadsafe_stack(const threadsafe_stack& other)
+	{
+		std::lock_guard<std::mutex> lock(other.m);
+		data = other.data;
+	}
+
+	threadsafe_stack& operator=(const threadsafe_stack&) = delete;
+
+	void push(T new_value)
+	{
+		std::lock_guard<std::mutex> lock(m);
+		data.push(std::move(new_value));
+	}
+
+	std::shared_ptr<T> pop()
+	{
+		std::lock_guard<std::mutex> lock(m);
+		if (data.empty()) throw empty_stack();
+		std::shared_ptr<T> const res(
+			std::make_shared<T>(std::move(data.top())));
+		data.pop();
+		return res;
+	}
+
+	void pop(T& value)
+	{
+		std::lock_guard<std::mutex> lock(m);
+		if (data.empty()) throw empty_stack();
+		value = std::move(data.top());
+		data.pop();
+	}
+
+	bool empty() const
+	{
+		std::lock_guard<std::mutex> lock(m);
+		return data.empty();
+	}
+};
+```
+
+```c++
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+
+#include "myStack.h"
+
+threadsafe_stack<int> g_stack;
+
+void add_data()
+{
+	int loop_count = 10;
+	for (int i = 0; i < loop_count; ++i)
+	{
+		g_stack.push(i);
+	}
+}
+
+void print_data()
+{
+	while (g_stack.empty())
+	{
+		std::this_thread::yield();
+	}
+
+	while (1)
+	{
+		try {
+			std::cout << *g_stack.pop() << std::endl;
+		}
+		catch(empty_stack &e){
+			std::cout << e.what();
+			break;
+		}
+	}
+}
+
+int main()
+{
+	auto t1 = std::thread(add_data);
+	auto t2 = std::thread(print_data);
+
+	t1.join();
+	t2.join();
+}
+```
+
+测试结果：
+
+```text
+9
+8
+7
+6
+5
+4
+3
+2
+1
+0
+empty stack.
+```
+
+现在来分析上面的`threadsafe_stack`模板：
+
+*	首先，每个成员函数在操作数据时，都对成员mutex进行了lock，这确保了一个时间只能有一个成员函数访问数据；
+*	再来，将标准stack的top与pop放在一起是为了防止条件竞争(race condition)，具体原因可参考[基础篇](https://chorior.github.io/2017/04/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%9F%BA%E7%A1%80%E7%AF%87/#api_design_with_mutex)；
+*	然后，对一个mutex进行lock时可能抛出一个异常，但这非常罕见，因为这是mutex出错或者系统资源缺失造成的，但是由于该操作是第一个操作，所以就算发生异常，数据也不会被更改，所以是安全的；**对一个mutex进行unlock时永远不会失败**；
+*	接着，对`data.push(std::move(new_value))`的调用可能会抛出异常，如果value的拷贝或移动函数(当T没有移动构造函数时，std::move会调用拷贝构造函数)抛出异常，或者内存不足的话。不管哪种情况，标准stack保证是安全的；
+*	继续，两个pop成员函数中的`std::make_shared`和`std::move`都可能抛出异常，但是就算抛出异常，也没有对数据进行更改，所以是安全的；
+*	最后，也许你觉得对代码已经分析完了，然而并不是，这里还用三个潜在的使用上的问题：
+	*	如果你的模板参数T是自定义类型，并且自定义了赋值运算符=，那么在使用复制构造函数或pop成员函数时，就会造成嵌套锁，这可能会造成死锁(dead-lock)，但是由于上锁的顺序是一定的，所以不太可能发生这个问题；
+	*	有两个不安全的成员函数：构造函数和析构函数。因为它们只能被调用一次。**你不能在构造完成之前或析构结束之后访问其实例**；
+	*	由于锁的原因，实际上一个时间点只有一个线程在使用这个stack工作；如果一个线程需要等待，那么它需要周期性的调用empty或pop抓取`empty_stack`异常，这消耗了不必要的资源用于检测数据，或者你必须写一些额外的等待代码(如condition variables)，但这又造成了不必要的中间锁，非常浪费。
+
+#### A thread-safe queue using locks and condition variables
+
+```c++
+#pragma once
+
+// 一个线程安全的简单queue模板
+#include <queue>
+#include <mutex>
+
+template<typename T>
+class threadsafe_queue
+{
+private:
+	mutable std::mutex mut;
+	std::queue<T> data_queue;
+	std::condition_variable data_cond;
+
+public:
+	threadsafe_queue()
+	{}
+
+	void push(T new_value)
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		data_queue.push(std::move(new_value));
+		data_cond.notify_one();
+	}
+
+	void wait_and_pop(T& value)
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
+		value = std::move(data_queue.front());
+		data_queue.pop();
+	}
+
+	std::shared_ptr<T> wait_and_pop()
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
+		std::shared_ptr<T> res(
+			std::make_shared<T>(std::move(data_queue.front())));
+		data_queue.pop();
+		return res;
+	}
+
+	bool try_pop(T& value)
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if (data_queue.empty())
+			return false;
+		value = std::move(data_queue.front());
+		data_queue.pop();
+		return true;
+	}
+
+	std::shared_ptr<T> try_pop()
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if (data_queue.empty())
+			return std::shared_ptr<T>();
+		std::shared_ptr<T> res(
+			std::make_shared<T>(std::move(data_queue.front())));
+		data_queue.pop();
+		return res;
+	}
+
+	bool empty() const
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		return data_queue.empty();
+	}
+};
+```
+
+```c++
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+
+#include "myQueue.h"
+
+threadsafe_queue<int> g_queue;
+
+void add_data()
+{
+	int loop_count = 10;
+	for (int i = 0; i < loop_count; ++i)
+	{
+		g_queue.push(i);
+	}
+}
+
+void print_data()
+{
+	while (1)
+	{
+		std::cout << *g_queue.wait_and_pop() << std::endl;
+	}
+}
+
+int main()
+{
+	auto t1 = std::thread(add_data);
+	auto t2 = std::thread(print_data);
+
+	t1.join();
+	t2.join();
+}
+```
+
+测试结果：
+
+```text
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+^C
+```
+
+现在来分析上面的`threadsafe_queue`模板：
+
+*	该模板与上面的stack模板类似，唯一不同的就是使用了`std::condition_variable`，所以你再也不用周期性的调用empty来做等待操作了，也不用抓取`empty_stack`异常了；
+*	当有多个线程在等待时，由于调用的是`notify_one()`，所以只会有一个线程被唤醒，然而当该线程发生异常时(如`std::make_shared`)，其它线程就不会被唤醒了，这里有三个方案来解决这个问题：
+	*	直接使用`notify_all()`；
+	*	当异常发生时，调用`notify_one()`尝试唤醒其它线程；
+	*	将`std::shared_ptr<>`的初始化移到push成员函数中去，并且标准queue改为存储`std::shared_ptr<>`而不是直接存储数据。下面的代码展示了第三个方案：
+
+```c++
+#pragma once
+
+// 一个改善了的线程安全的简单queue模板
+#include <queue>
+#include <mutex>
+
+template<typename T>
+class threadsafe_queue
+{
+private:
+	mutable std::mutex mut;
+	std::queue<std::shared_ptr<T> > data_queue;
+	std::condition_variable data_cond;
+
+public:
+	threadsafe_queue()
+	{}
+
+	void push(T new_value)
+	{
+		// 内存分配往往是非常耗时的，
+		// 将其放置在lock之外，极大地缩短了持有mutex的时长
+		std::shared_ptr<T> data(
+			std::make_shared<T>(std::move(new_value)));
+		std::lock_guard<std::mutex> lk(mut);
+		data_queue.push(data);
+		data_cond.notify_one();
+	}
+
+	void wait_and_pop(T& value)
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
+		value = std::move(*data_queue.front());
+		data_queue.pop();
+	}
+
+	bool try_pop(T& value)
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if (data_queue.empty())
+			return false;
+		value = std::move(*data_queue.front());
+		data_queue.pop();
+		return true;
+	}
+
+	std::shared_ptr<T> wait_and_pop()
+	{
+		std::unique_lock<std::mutex> lk(mut);
+		data_cond.wait(lk, [this] {return !data_queue.empty(); });
+		std::shared_ptr<T> res = data_queue.front();
+		data_queue.pop();
+		return res;
+	}
+
+	std::shared_ptr<T> try_pop()
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		if (data_queue.empty())
+			return std::shared_ptr<T>();
+		std::shared_ptr<T> res = data_queue.front();
+		data_queue.pop();
+		return res;
+	}
+
+	bool empty() const
+	{
+		std::lock_guard<std::mutex> lk(mut);
+		return data_queue.empty();
+	}
+};
+```
+
+#### A thread-safe queue using fine-grained locks and condition variables
+
+上面的stack和queue只有一个需要保护的成员，因此只需要一个mutex。为了使用细粒度的锁，你需要观察queue的内部组成，并且关联一个mutex到每一个数据项。
+
+最简单的队列数据结构就是单链表了。
+
+![singly linked list](https://raw.githubusercontent.com/xiaoweiChen/Cpp_Concurrency_In_Action/master/images/chapter6/6-1.png)
+
+```c++
+#pragma once
+
+// 一个简单的单线程队列实现
+template<typename T>
+class queue
+{
+private:
+	struct node
+	{
+		T data;
+		std::unique_ptr<node> next;
+		node(T data_) :
+			data(std::move(data_))
+		{}
+	};
+
+	std::unique_ptr<node> head;
+	node* tail; // 使用标准指针而非智能指针是因为unique_ptr只能独占
+
+public:
+	queue()
+	{}
+
+	queue(const queue& other) = delete;
+	queue& operator=(const queue& other) = delete;
+
+	std::shared_ptr<T> try_pop()
+	{
+		if (!head)
+		{
+			return std::shared_ptr<T>();
+		}
+		std::shared_ptr<T> const res(
+			std::make_shared<T>(std::move(head->data)));
+		std::unique_ptr<node> const old_head = std::move(head);
+		head = std::move(old_head->next);
+		return res;
+	}
+
+	void push(T new_value)
+	{
+		std::unique_ptr<node> p(new node(std::move(new_value)));
+		node* const new_tail = p.get();
+		if (tail)
+		{
+			tail->next = std::move(p);
+		}
+		else
+		{
+			head = std::move(p);
+		}
+		tail = new_tail;
+	}
+};
+```
+
+上面的实现对单线程来说，没什么问题。但是如果你要使用细粒度的锁来对应多线程的话，就会出现一系列可能导致你出错的事情。该队列有两个数据成员head和tail，原则上你可以使用两个mutex分别对其进行保护，但这会造成一系列问题：
+
+*	最明显的问题是push函数既可以修改head，也可以修改tail，所以它不得不锁住两个mutex；
+*	最严重的问题是当队列只有一个元素时，如果两个线程分别使用push和`try_pop`，由于此时`head.get() == tail`，所以`tail->next`和`head->next`指向的是同一个元素，所以需要同一个mutex进行保护，这还不如最开始的stack和queue呢。解决该问题的方法就是预先添加一个假的没有数据的node，这样就避免了这个问题：
+	*	对于一个空队列，head和tail指向同一个假的node而非原来的nullptr；
+	*	当你添加一个元素时，更新tail，然后使其指向下一个假元素，这样head和tail将永远指向不同的元素，因此就不会造成对`head->next`和`tail->next`的竞争了。
+
+```c++
+#pragma once
+
+// 一个改善的简单的单线程队列实现
+template<typename T>
+class queue
+{
+private:
+	struct node
+	{
+		std::shared_ptr<T> data;
+		std::unique_ptr<node> next;
+	};
+
+	std::unique_ptr<node> head;
+	node* tail;
+
+public:
+	queue() :
+		head(new node), tail(head.get())
+	{}
+
+	queue(const queue& other) = delete;
+	queue& operator=(const queue& other) = delete;
+
+	std::shared_ptr<T> try_pop()
+	{
+		if (head.get() == tail)
+		{
+			return std::shared_ptr<T>();
+		}
+		std::shared_ptr<T> const res(head->data);
+		std::unique_ptr<node> old_head = std::move(head);
+		head = std::move(old_head->next);
+		return res;
+	}
+
+	void push(T new_value)
+	{
+		std::shared_ptr<T> new_data(
+			std::make_shared<T>(std::move(new_value)));
+		std::unique_ptr<node> p(new node);
+		tail->data = new_data;
+		node* const new_tail = p.get();
+		tail->next = std::move(p);
+		tail = new_tail;
+	}
+};
+```
+
+现在push只访问tail了，`try_pop`虽然同时访问head和tail，但是tail只是被用作初始比较，因此只需要短暂的lock。最大的增益就是`try_pop`和push永远不会在同一个node上操作了，所以你可以大胆的使用一个mutex保护head，一个mutex保护tail。
+
+```c++
+#pragma once
+
+// 一个简单的使用细粒度锁的thread safe队列实现
+#include <mutex>
+
+template<typename T>
+class threadsafe_queue
+{
+private:
+	struct node
+	{
+		std::shared_ptr<T> data;
+		std::unique_ptr<node> next;
+	};
+
+	std::mutex head_mutex;
+	std::unique_ptr<node> head;
+	std::mutex tail_mutex;
+	node* tail;
+
+	node* get_tail()
+	{
+		std::lock_guard<std::mutex> tail_lock(tail_mutex);
+		return tail;
+	}
+
+	std::unique_ptr<node> pop_head()
+	{
+		std::lock_guard<std::mutex> head_lock(head_mutex);
+		if (head.get() == get_tail())
+		{
+			return nullptr;
+		}
+		std::unique_ptr<node> old_head = std::move(head);
+		head = std::move(old_head->next);
+		return old_head;
+	}
+
+public:
+	threadsafe_queue() :
+		head(new node), tail(head.get())
+	{}
+
+	threadsafe_queue(const threadsafe_queue& other) = delete;
+	threadsafe_queue& operator=(const threadsafe_queue& other) = delete;
+
+	std::shared_ptr<T> try_pop()
+	{
+		std::unique_ptr<node> old_head = pop_head();
+		return old_head ? old_head->data : std::shared_ptr<T>();
+	}
+
+	void push(T new_value)
+	{
+		std::shared_ptr<T> new_data(
+			std::make_shared<T>(std::move(new_value)));
+		std::unique_ptr<node> p(new node);
+		node* const new_tail = p.get();
+		std::lock_guard<std::mutex> tail_lock(tail_mutex);
+		tail->data = new_data;
+		tail->next = std::move(p);
+		tail = new_tail;
+	}
+};
+```
+
+将`get_tail`放在`head_mutex`的lock范围内是为了保证得到的tail一定指向假元素，head也一定是当前的head。设想一种情况：将`get_tail`放置在`head_mutex`的lock范围外，如下所示：
+
+```c++
+std::unique_ptr<node> pop_head()
+{
+	node* const old_tail = get_tail();
+	std::lock_guard<std::mutex> head_lock(head_mutex);
+	if (head.get() == old_tail)
+	{
+		return nullptr;
+	}
+	std::unique_ptr<node> old_head = std::move(head);
+	head = std::move(old_head->next);
+	return old_head;
+}
+```
+
+当`get_tail`返回时，此时head可能已经发生了改变，在head和tail做比较时，也许tail已经被重新附了值，这样head不是你想要的head，tail也不是你想要的tail，就会造成跟预想结果不同的行为发生，将`get_tail`放在`head_mutex`的lock范围内就能完美的避免这种情况。
+
+```c++
+#pragma once
+
+// 一个较完整的使用细粒度锁的thread safe队列
+#include <condition_variable>
+
+template<typename T>
+class threadsafe_queue
+{
+private:
+	struct node
+	{
+		std::shared_ptr<T> data;
+		std::unique_ptr<node> next;
+	};
+
+	std::mutex head_mutex;
+	std::unique_ptr<node> head;
+	std::mutex tail_mutex;
+	node* tail;
+	std::condition_variable data_cond;
+
+	node* get_tail()
+	{
+		std::lock_guard<std::mutex> tail_lock(tail_mutex);
+		return tail;
+	}
+
+	std::unique_ptr<node> pop_head()
+	{
+		std::unique_ptr<node> old_head = std::move(head);
+		head = std::move(old_head->next);
+		return old_head;
+	}
+
+	std::unique_lock<std::mutex> wait_for_data()
+	{
+		std::unique_lock<std::mutex> head_lock(head_mutex);
+		data_cond.wait(head_lock, [&] {return head.get() != get_tail(); });
+		return std::move(head_lock);
+	}
+
+	std::unique_ptr<node> wait_pop_head()
+	{
+		std::unique_lock<std::mutex> head_lock(wait_for_data());
+		return pop_head();
+	}
+
+	std::unique_ptr<node> wait_pop_head(T& value)
+	{
+		std::unique_lock<std::mutex> head_lock(wait_for_data());
+		value = std::move(*head->data);
+		return pop_head();
+	}
+
+	std::unique_ptr<node> try_pop_head()
+	{
+		std::lock_guard<std::mutex> head_lock(head_mutex);
+		if (head.get() == get_tail())
+		{
+			return std::unique_ptr<node>();
+		}
+		return pop_head();
+	}
+
+	std::unique_ptr<node> try_pop_head(T& value)
+	{
+		std::lock_guard<std::mutex> head_lock(head_mutex);
+		if (head.get() == get_tail())
+		{
+			return std::unique_ptr<node>();
+		}
+		value = std::move(*head->data);
+		return pop_head();
+	}
+
+public:
+	threadsafe_queue() :
+		head(new node), tail(head.get())
+	{}
+
+	threadsafe_queue(const threadsafe_queue& other) = delete;
+	threadsafe_queue& operator=(const threadsafe_queue& other) = delete;
+
+	void push(T new_value)
+	{
+		std::shared_ptr<T> new_data(
+			std::make_shared<T>(std::move(new_value)));
+		std::unique_ptr<node> p(new node);
+		{
+			std::lock_guard<std::mutex> tail_lock(tail_mutex);
+			tail->data = new_data;
+			node* const new_tail = p.get();
+			tail->next = std::move(p);
+			tail = new_tail;
+		}
+		data_cond.notify_one();
+	}
+
+	std::shared_ptr<T> wait_and_pop()
+	{
+		std::unique_ptr<node> const old_head = wait_pop_head();
+		return old_head->data;
+	}
+
+	void wait_and_pop(T& value)
+	{
+		std::unique_ptr<node> const old_head = wait_pop_head(value);
+	}
+
+	std::shared_ptr<T> try_pop()
+	{
+		std::unique_ptr<node> old_head = try_pop_head();
+		return old_head ? old_head->data : std::shared_ptr<T>();
+	}
+
+	bool try_pop(T& value)
+	{
+		std::unique_ptr<node> const old_head = try_pop_head(value);
+		return old_head;
+	}
+
+	void empty()
+	{
+		std::lock_guard<std::mutex> head_lock(head_mutex);
+		return (head.get() == get_tail());
+	}
+};
+```
+
+<h3 id="complex_lock_based_concurrent_data_structures">基于锁的复杂并发数据结构设计</h3>
+
+stack和queue非常简单，它们的接口相对固定，并且它们也应用于比较特殊的场合。大多数数据结构支持各种各样的操作，原则上这能**增大并发的可能性，但是也增大了数据保护的困难度**。
