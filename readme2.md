@@ -1940,3 +1940,292 @@ public:
 <h3 id="complex_lock_based_concurrent_data_structures">基于锁的复杂并发数据结构设计</h3>
 
 stack和queue非常简单，它们的接口相对固定，并且它们也应用于比较特殊的场合。大多数数据结构支持各种各样的操作，原则上这能**增大并发的可能性，但是也增大了数据保护的困难度**。
+
+#### Writing a thread-safe lookup table using locks
+
+查找表(lookup table)就是键值对(key-value)的集合，在标准库中，如果键与值相等就是set，不等就是map。
+
+查询表的使用与栈和队列不同。栈和队列上，几乎每个操作都会对数据结构进行修改，不是添加一个元素，就是删除一个，而对于查询表来说，几乎不需要什么修改。和队列和栈一样，标准容器的接口不适合多线程进行并发访问，因为这些接口在设计的时候都存在固有的条件竞争，所以这些接口需要砍掉，以及重新修订。
+
+并发访问时，`std::map<>`接口最大的问题在于——迭代器。当你在处理一个迭代器时，也许其它线程已经删除了该迭代器指向的元素。关于迭代器的多线程设计可以放到后面，现在我们先来看一些查找表(lookup table)的基本操作：
+
+*	添加一个键值对；
+*	对于一个给定的键值，修改与其关联的值；
+*	删除一个键值和其关联的值；
+*	对于一个给定的键值，获取其关联的所有值；
+*	是否为空。
+
+如果你坚持使用简单的线程安全规范的话，你也可以在每个成员函数中只使用一个mutex进行上锁保护，这样肯定是安全的。有一个潜在的问题是：当两个线程同时对一个单映射查找表(lookup table)添加相同的键值对时，只有先开始的线程会成功。一种办法就是将添加和修改放在同一个成员函数中去。
+
+当要查找的键值不存在时，可以添加一个默认值。
+
+```c++
+mapped_type get_value(key_type const& key, mapped_type default_value);
+```
+
+你也可以返回一个`std::pair<mapped_type,bool>`，其中bool值指示该键值是否存在；或者你也可以返回一个智能指针，当其为nullptr时，表示该键值不存在。
+
+一旦接口决定了，你就可以开始码代码了。使用单个mutex对每个成员函数上锁会浪费并发的可能性；一个选项是使用一个支持多线程读和单线程改的mutex，如`boost::shared_mutex`；但理想情况下，我们可以做得更好。
+
+#### designing a map data structure for fine-grained locking
+
+要想得到细粒度的锁，你必须小心查看数据结构的实现细节，而不能直接包装已存在的容器，如`std::map<>`。这边有三个常见的方式来实现关联容器：
+
+*	二叉树，如红黑树；
+*	已排序数组；
+*	哈希表。
+
+二叉树并不能提供太多扩展并发的机会，每个查找或修改都不得不从访问根节点开始，因此根节点需要被上锁；虽然这个锁在访问线程向树下移动时可以被释放，但并不比直接使用单个锁锁住整个数据结构好太多。
+
+已排序数组更差，因为你不能提前知晓一个给定的数据在该数组中的位置，所以你需要对整个数组上锁。
+
+剩下的就只有哈希表了。假设有一个固定数量的buckets(一个键值拥有一个bucket，其关联的所有值都放在该bucket中)，一个键值所属的bucket纯粹是该键值的一个属性及哈希函数(**Assuming a fixed number of buckets, which bucket a key belongs to is purely a property of the key and its hash function**)。这意味着你可以安全的对每个bucket使用不同的锁。如果你仍然使用类似`boost::shared_mutex`的mutex，你就能将并发的机会增加N倍，其中N是bucket的数量(显然原来只能有一个线程在写，现在可以有N个了)。缺点就是你需要为键值(key)设计一个好的哈希函数(对于一个给定值，任何时候调用此函数都应该返回相同的结果，对于不等的对象几乎总是产生不同的结果)，庆幸的是，C++标准库提供了`std::hash<>`模板，一些基本的类型如int，还有一些常用的标准库类型如`std::string`都提供了特例化，你可以直接拿来使用，对于自定义类型可以查看[模板特例化](https://chorior.github.io/2017/04/04/C++-%E9%87%8A%E7%96%91-%E4%B8%89/#template_specialization)自行特例化。
+
+```c++
+#pragma once
+
+// 一个完成了基本功能的线程安全查找表
+#include <vector>
+#include <list>
+#include <mutex>
+#include <boost\thread\shared_mutex.hpp>
+#include <boost\thread\locks.hpp>
+
+template<typename Key, typename Value, typename Hash = std::hash<Key>>
+class threadsafe_lookup_table
+{
+private:
+	class bucket_type
+	{
+	private:
+		typedef std::pair<Key, Value> bucket_value;
+		typedef std::list<bucket_value> bucket_data;
+		typedef typename bucket_data::iterator bucket_iterator;
+
+		bucket_data data;
+		mutable boost::shared_mutex mutex;
+
+		bucket_iterator find_entry_for(Key const& key) const
+		{
+			return std::find_if(data.begin(), data.end(),
+				[&](bucket_value const& item)
+			{return item.first == key; });
+		}
+
+	public:
+		Value value_for(Key const& key, Value const& default_value) const
+		{
+			boost::shared_lock<boost::shared_mutex> lock(mutex);
+			bucket_iterator const found_entry = find_entry_for(key);
+			return (found_entry == data.end()) ?
+				default_value : found_entry->second;
+		}
+
+		void add_or_update_mapping(Key const& key, Value const& value)
+		{
+			std::unique_lock<boost::shared_mutex> lock(mutex);
+			bucket_iterator const found_entry = find_entry_for(key);
+			if (found_entry == data.end())
+			{
+				data.push_back(bucket_value(key, value));
+			}
+			else
+			{
+				found_entry->second = value;
+			}
+		}
+
+		void remove_mapping(Key const& key)
+		{
+			std::unique_lock<boost::shared_mutex> lock(mutex);
+			bucket_iterator const found_entry = find_entry_for(key);
+			if (found_entry != data.end())
+			{
+				data.erase(found_entry);
+			}
+		}
+	};
+
+	std::vector<std::unique_ptr<bucket_type> > buckets;
+	Hash hasher;
+
+	bucket_type& get_bucket(Key const& key) const
+	{
+		std::size_t const bucket_index = hasher(key) % buckets.size();
+		return *buckets[bucket_index];
+	}
+
+public:
+	typedef Key key_type;
+	typedef Value mapped_type;
+	typedef Hash hash_type;
+
+	threadsafe_lookup_table(unsigned num_buckets = 19, Hash const& hasher_ = Hash()) :
+		buckets(num_buckets), hasher(hasher_)
+	{
+		for (unsigned i = 0; i<num_buckets; ++i)
+		{
+			buckets[i].reset(new bucket_type);
+		}
+	}
+
+	threadsafe_lookup_table(threadsafe_lookup_table const& other) = delete;
+	threadsafe_lookup_table& operator=(threadsafe_lookup_table const& other) = delete;
+
+	Value value_for(Key const& key, Value const& default_value = Value()) const
+	{
+		return get_bucket(key).value_for(key, default_value);
+	}
+
+	void add_or_update_mapping(Key const& key, Value const& value)
+	{
+		get_bucket(key).add_or_update_mapping(key, value);
+	}
+
+	void remove_mapping(Key const& key)
+	{
+		get_bucket(key).remove_mapping(key);
+	}
+};
+```
+
+上面的示例函数不多，仔细看个十分钟左右应该能够看懂。仔细看完，你会发现，该代码其实是相当简单的，但是每个关键的地方都做了适当的数据保护。其中bucket数量的默认值是19，这个值是随便写的，但是哈希表在拥有质数个buckets的时候工作的最好；因为bucket的数量是固定的，所以`get_bucket`可以在无锁的状态下被调用，然后再通过`bucket_type`的成员函数进行适当的数据保护。
+
+该示例是线程安全的，但是不是异常安全的呢？首先，`value_for`并不修改数据，它抛不抛出异常无关紧要；`remove_mapping`调用了erase，但erase保证不会抛出异常，所以是安全的；最后是`add_or_update_mapping`，它的两个if分支都可能抛出异常，`push_back`如果抛出异常会将list保持在原有状态，所以是安全的，如果赋值运算符抛出异常，你可以祈祷它保持在原有状态，然而这不并影响整个数据结构，这完全是用户提供的类型的一个属性，你可以安全的留给用户来处理这件事。
+
+在获取全部键值对快照的时候，需要锁住全部的buckets：
+
+```c++
+std::map<Key, Value> get_map() const
+{
+	std::vector<std::unique_lock<boost::shared_mutex> > locks;
+	for (unsigned i = 0; i<buckets.size(); ++i)
+	{
+		locks.push_back(
+			std::unique_lock<boost::shared_mutex>(buckets[i].mutex));
+	}
+	std::map<Key, Value> res;
+	for (unsigned i = 0; i<buckets.size(); ++i)
+	{
+		for (auto it = buckets[i].data.begin();
+			it != buckets[i].data.end();
+			++it)
+		{
+			res.insert(*it);
+		}
+	}
+	return res;
+}
+
+std::vector<Key> get_Key() const
+{
+	std::vector<std::unique_lock<boost::shared_mutex> > locks;
+	for (unsigned i = 0; i<buckets.size(); ++i)
+	{
+		locks.push_back(
+			std::unique_lock<boost::shared_mutex>(buckets[i].mutex));
+	}
+	std::vector<Key> res;
+	for (unsigned i = 0; i<buckets.size(); ++i)
+	{
+		for (auto it = buckets[i].data.begin();
+			it != buckets[i].data.end();
+			++it)
+		{
+			res.insert(it->first);
+		}
+	}
+	return res;
+}
+```
+
+在测试编译时，`bucket_type`的`find_entry_for`一直提示不能将`const_iterator`转换成`iterator`，发现其是const限定的，所以data是const的，故而`data.begin()`、`data.end()`返回的都是`const_iterator`，而函数要求返回的是`iterator`，由于后面的`add_or_update_mapping`和`remove_mapping`也调用了该函数，并且修改了其指向的数据，所以不能直接将`bucket_iterator`改为`bucket_const_iterator`，解决方案是重载该函数，一个const限定返回`bucket_const_iterator`，一个没有const限定，返回`bucket_iterator`，如下所示：
+
+```c++
+typedef std::pair<Key, Value> bucket_value;
+typedef std::list<bucket_value> bucket_data;
+typedef typename bucket_data::iterator bucket_iterator;
+typedef typename bucket_data::const_iterator bucket_const_iterator;
+
+bucket_data data;
+mutable boost::shared_mutex mutex;
+
+bucket_iterator find_entry_for(Key const& key)
+{
+	return std::find_if(data.begin(), data.end(),
+		[&](bucket_value const& item){return item.first == key; });
+}
+
+bucket_const_iterator find_entry_for(Key const& key) const
+{
+	return std::find_if(data.begin(), data.end(),
+		[&](bucket_value const& item) {return item.first == key; });
+}
+```
+
+测试代码如下：
+
+```c++
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+
+#include "myLookupTable.h"
+
+threadsafe_lookup_table<int,int> g_lookup_table;
+
+void add_data()
+{
+	int loop_count = 10;
+	for (int i = 0; i < loop_count; ++i)
+	{
+		g_lookup_table.add_or_update_mapping(i, i);
+	}
+}
+
+void print_data()
+{
+	int loop_count = 10;
+	for (int i = 0; i < loop_count; ++i)
+	{
+		std::cout << g_lookup_table.value_for(i, 0) << std::endl;
+	}
+}
+
+int main()
+{
+	auto t1 = std::thread(add_data);
+	auto t2 = std::thread(print_data);
+
+	t1.join();
+	t2.join();
+}
+```
+
+`boost::thread`的库需要编译，步骤如下：
+
+*	dos下进入到你下载的boost解压包文件夹，我的是`cd E:\boost_1_64_0\boost_1_64_0`；
+*	`cd tools\build`；
+*	`bootstrap.bat`；
+*	复制生成的`bjam.exe`到`E:\boost_1_64_0\boost_1_64_0`下；
+*	`cd E:\boost_1_64_0\boost_1_64_0`；
+*	根据你的vs版本，你可以先不添加库编译，vs会告诉你需要的库及你的vs版本号，`bjam --toolset=msvc-14.1 --with-thread stage`；
+*	`bjam --toolset=msvc-14.1 --with-date_time stage`；
+*	最后需要的lib在`E:\boost_1_64_0\boost_1_64_0\stage\lib`下；
+*	在debug/x86模式下添加库输入`libboost_date_time-vc141-mt-gd-1_64.lib`和`libboost_thread-vc141-mt-gd-1_64.lib`即可。
+
+测试结果(测试程序可能需要修改，用于确保print发生在add之后)：
+
+```text
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+```
