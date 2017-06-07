@@ -31,6 +31,9 @@ tags:
 *	[基于锁的并发数据结构设计](#designing_lock_based_concurrent_data_structures)
 	*	[基于锁的简单并发数据结构设计](#simple_lock_based_concurrent_data_structures)
 	*	[基于锁的复杂并发数据结构设计](#complex_lock_based_concurrent_data_structures)
+*	[无锁并发数据结构设计](#designing_lock_free_concurrent_data_structures)
+	*	[what's lock free, why do I use it](#what_is_loc_free)
+	*	[无锁数据结构示例](#examples_of_lock_free_data_structures)
 
 <h2 id="the_c_plus_plus_memory_model_and_atomic_operation">C++ 内存模型和原子操作</h2>
 
@@ -2537,3 +2540,60 @@ int main()
 ```text
 9 8 7 6 5 4 3 2 1 0
 ```
+
+<h2 id="designing_lock_free_concurrent_data_structures">无锁并发数据结构设计</h2>
+
+mutex是确保多线程可以安全的访问数据，而没有条件竞争(race condition)和破坏的不变量(一个线程在写，另一个线程看到了在写过程中的状态)的强有力工具。使用它也是相对比较直接的：该段代码是否需要保护。当然它也不是没有缺点的，不正确的使用可能会导致死锁(dead lock)。如果你能写出能够安全并发且无锁的数据结构出来，那么潜在意义上就避免了这个问题，这样的数据结构称为“无锁数据结构”。
+
+**无锁数据结构的设计必须小心又小心，因为一些导致失败的条件可能很少发生**。
+
+<h3 id="what_is_loc_free">what's lock free, why do I use it</h3>
+
+使用mutex、condition variable或future进行数据同步的算法或数据结构被称为阻塞式算法或数据结构，不使用阻塞式函数的算法或数据结构被称为非阻塞算法或数据结构。
+
+**并不是所有的非阻塞式数据结构都是无锁的**。
+
+我们再来看这个用`std::atomic_flag`实现的spinlock mutex：
+
+```c++
+// 一个使用std::atomic_flag的spinlock mutex实现
+class spinlock_mutex
+{
+	std::atomic_flag flag;
+public:
+	spinlock_mutex() :
+		flag{ ATOMIC_FLAG_INIT }
+	{}
+	void lock()
+	{
+		// test_and_set: 将状态设置为set，即flag设置为true，返回前一个值
+		// 如果flag是clear状态，那么循环终止
+		// 如果flag是set状态，即该对象已经被lock了，就一直循环等待unlock
+		while (flag.test_and_set(std::memory_order_acquire));
+	}
+	void unlock()
+	{
+		flag.clear(std::memory_order_release);
+	}
+};
+```
+
+该代码没有调用任何阻塞式函数，任何调用该mutex的代码都是非阻塞的，但是它不是无锁的，一个时间点还是只能有一个线程lock该mutex。
+
+**如果一个数据结构被称为无锁的，那么多个线程一定可以并发的访问该数据结构**。这些线程不需要做相同的操作，一个无锁的queue可能允许一个线程push，另一个线程pop，甚至在两个线程同时push时造成中断；不仅如此，当一个线程被调度器中途挂起时，另外的线程仍然可以继续完成它的操作而不用等待这个被挂起的线程。
+
+compare/exchange操作经常被用在循环里面，之所以用compare/exchange操作是因为其它线程可能同时对数据做了更改，因此需要在重新调用compare/exchange操作前重新做一系列操作。这样的代码在那些修改数据的线程被挂起并操作成功时也可以是无锁的，否则就跟spin lock一样，非阻塞但非无锁。具有这种循环的无锁算法可能导致一个线程遭受饥饿：如果另一个线程使用“错误”时序执行操作，则另一个线程可能会在第一个线程不断重试其操作时进行。避免这种问题的数据结构时无等待的，也是无锁的。
+
+>Lock-free algorithms with such loops can result in one thread being subject to starvation. If another thread performs operations with the “wrong” timing, the other thread might make progress while the first thread continually has to retry its operation. Data structures that avoid this problem are wait-free as well as lock-free.
+
+**无等待数据结构是一个无锁的数据结构，其附加属性是访问数据结构的每个线程都可以在有限数量的步骤中完成其操作，而不管其他线程的行为如何**，因为与其他线程冲突而涉及无限次重试的算法因此不会等待。正确书写无等待数据结构时非常非常困难的**：为了确保每个线程都能在有限数量的步骤中完成其操作，你必须确保每个操作都可以在单次执行中执行，并且一个线程执行的步骤不会导致另一个线程上的操作失败**。
+
+由于正确的获得一个无锁或无等待的数据结构的困难性，你**必须确保得到的好处超过了成本**：
+
+*	使用无锁数据结构的最主要原因是获得最大的并发性能，**使用无锁数据结构时，每个线程都能向前进而不管其它线程在做什么，也不需要等待**，这样的功能谁都想要，但是却很难实现，最终得到像spin lock那样的数据结构太容易了；
+*	使用无锁数据结构的第二个原因是鲁棒性(robustness)，如果你个线程在持有锁时被销毁，那么这个数据结构就永远损坏了，但如果使用的是无锁数据结构，那么损坏的就只有那个线程的数据了，其他线程可以正常运行；
+*	如果你不能排除其它线程访问数据结构，那么你就要小心维护不变量，为了避免条件竞争(race condition)，你必须使用原子操作来修改数据，除此之外，你还必须确保修改以正确的顺序显示给其它线程；
+*	因为没有锁，所以无锁数据结构不会造成dead lock，但是可能造成live lock：想象当两个线程都想要修改数据，但是任何一个线程所做的操作都会导致两一个线程的操作重新执行，所以两个线程会一直循环尝试。就像两个人同时从两边过一个独木桥，必须要一方通过之后，另一方才能继续通过。就定义上来讲，无等待数据结构是不会造成live lock的，因为它们执行操作的步骤总是有上限的，但换个角度讲，无等待算法要比等待算法复杂度高，且就算没有其它线程访问数据也会需要更多的步骤来完成对应操作。
+*	尽管无锁或无等待数据结构可以增加并发操作的潜力，并减少线程花费等待的时间，但它可能会降低整体性能。因为原子操作可能比非原子操作慢得多，并且无锁数据结构的操作相对于使用锁的数据结构的操作要更多；不仅如此，硬件必须在访问相同原子变量的线程之间同步数据。
+
+<h3 id="examples_of_lock_free_data_structures">无锁数据结构示例</h3>
