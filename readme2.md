@@ -1984,7 +1984,7 @@ mapped_type get_value(key_type const& key, mapped_type default_value);
 ```c++
 #pragma once
 
-// 一个完成了基本功能的线程安全查找表
+// 一个完成了基本功能的细粒度线程安全查找表
 #include <vector>
 #include <list>
 #include <mutex>
@@ -1997,7 +1997,7 @@ class threadsafe_lookup_table
 private:
 	class bucket_type
 	{
-	private:
+	public:
 		typedef std::pair<Key, Value> bucket_value;
 		typedef std::list<bucket_value> bucket_data;
 		typedef typename bucket_data::iterator bucket_iterator;
@@ -2005,14 +2005,14 @@ private:
 		bucket_data data;
 		mutable boost::shared_mutex mutex;
 
+	private:
 		bucket_iterator find_entry_for(Key const& key) const
 		{
 			return std::find_if(data.begin(), data.end(),
 				[&](bucket_value const& item)
 			{return item.first == key; });
 		}
-
-	public:
+	
 		Value value_for(Key const& key, Value const& default_value) const
 		{
 			boost::shared_lock<boost::shared_mutex> lock(mutex);
@@ -2021,6 +2021,7 @@ private:
 				default_value : found_entry->second;
 		}
 
+	public:
 		void add_or_update_mapping(Key const& key, Value const& value)
 		{
 			std::unique_lock<boost::shared_mutex> lock(mutex);
@@ -2102,13 +2103,13 @@ std::map<Key, Value> get_map() const
 	for (unsigned i = 0; i<buckets.size(); ++i)
 	{
 		locks.push_back(
-			std::unique_lock<boost::shared_mutex>(buckets[i].mutex));
+			std::unique_lock<boost::shared_mutex>(buckets[i]->mutex));
 	}
 	std::map<Key, Value> res;
 	for (unsigned i = 0; i<buckets.size(); ++i)
 	{
-		for (auto it = buckets[i].data.begin();
-			it != buckets[i].data.end();
+		for (auto it = buckets[i]->data.begin();
+			it != buckets[i]->data.end();
 			++it)
 		{
 			res.insert(*it);
@@ -2123,16 +2124,16 @@ std::vector<Key> get_Key() const
 	for (unsigned i = 0; i<buckets.size(); ++i)
 	{
 		locks.push_back(
-			std::unique_lock<boost::shared_mutex>(buckets[i].mutex));
+			std::unique_lock<boost::shared_mutex>(buckets[i]->mutex));
 	}
 	std::vector<Key> res;
 	for (unsigned i = 0; i<buckets.size(); ++i)
 	{
-		for (auto it = buckets[i].data.begin();
-			it != buckets[i].data.end();
+		for (auto it = buckets[i]->data.begin();
+			it != buckets[i]->data.end();
 			++it)
 		{
-			res.insert(it->first);
+			res.push_back(it->first);
 		}
 	}
 	return res;
@@ -2142,25 +2143,161 @@ std::vector<Key> get_Key() const
 在测试编译时，`bucket_type`的`find_entry_for`一直提示不能将`const_iterator`转换成`iterator`，发现其是const限定的，所以data是const的，故而`data.begin()`、`data.end()`返回的都是`const_iterator`，而函数要求返回的是`iterator`，由于后面的`add_or_update_mapping`和`remove_mapping`也调用了该函数，并且修改了其指向的数据，所以不能直接将`bucket_iterator`改为`bucket_const_iterator`，解决方案是重载该函数，一个const限定返回`bucket_const_iterator`，一个没有const限定，返回`bucket_iterator`，如下所示：
 
 ```c++
-typedef std::pair<Key, Value> bucket_value;
-typedef std::list<bucket_value> bucket_data;
-typedef typename bucket_data::iterator bucket_iterator;
-typedef typename bucket_data::const_iterator bucket_const_iterator;
+#pragma once
 
-bucket_data data;
-mutable boost::shared_mutex mutex;
+// 一个改善了的完成了基本功能的细粒度线程安全查找表
+#include <vector>
+#include <list>
+#include <mutex>
+#include <algorithm>
+#include <boost\thread\shared_mutex.hpp>
+#include <boost\thread\locks.hpp>
 
-bucket_iterator find_entry_for(Key const& key)
+template<typename Key, typename Value, typename Hash = std::hash<Key>>
+class threadsafe_lookup_table
 {
-	return std::find_if(data.begin(), data.end(),
-		[&](bucket_value const& item){return item.first == key; });
-}
+private:
+	class bucket_type
+	{
+	public:
+		typedef std::pair<Key, Value> bucket_value;
+		typedef std::list<bucket_value> bucket_data;
+		typedef typename bucket_data::iterator bucket_iterator;
+		typedef typename bucket_data::const_iterator bucket_const_iterator;
 
-bucket_const_iterator find_entry_for(Key const& key) const
-{
-	return std::find_if(data.begin(), data.end(),
-		[&](bucket_value const& item) {return item.first == key; });
-}
+		bucket_data data;
+		mutable boost::shared_mutex mutex;
+
+	private:
+		bucket_iterator find_entry_for(Key const& key)
+		{
+			return std::find_if(data.begin(), data.end(),
+				[&](bucket_value const& item){return item.first == key; });
+		}
+
+		bucket_const_iterator find_entry_for(Key const& key) const
+		{
+			return std::find_if(data.begin(), data.end(),
+				[&](bucket_value const& item) {return item.first == key; });
+		}
+
+	public:
+		Value value_for(Key const& key, Value const& default_value) const
+		{
+			boost::shared_lock<boost::shared_mutex> lock(mutex);
+			bucket_const_iterator found_entry = find_entry_for(key);
+			return (found_entry == data.end()) ?
+				default_value : found_entry->second;
+		}
+
+		void add_or_update_mapping(Key const& key, Value const& value)
+		{
+			std::unique_lock<boost::shared_mutex> lock(mutex);
+			bucket_iterator const found_entry = find_entry_for(key);
+			if (found_entry == data.end())
+			{
+				data.push_back(bucket_value(key, value));
+			}
+			else
+			{
+				found_entry->second = value;
+			}
+		}
+
+		void remove_mapping(Key const& key)
+		{
+			std::unique_lock<boost::shared_mutex> lock(mutex);
+			bucket_iterator const found_entry = find_entry_for(key);
+			if (found_entry != data.end())
+			{
+				data.erase(found_entry);
+			}
+		}
+	};
+
+	std::vector<std::unique_ptr<bucket_type> > buckets;
+	Hash hasher;
+
+	bucket_type& get_bucket(Key const& key) const
+	{
+		std::size_t const bucket_index = hasher(key) % buckets.size();
+		return *buckets[bucket_index];
+	}
+
+public:
+	typedef Key key_type;
+	typedef Value mapped_type;
+	typedef Hash hash_type;
+
+	threadsafe_lookup_table(unsigned num_buckets = 19, Hash const& hasher_ = Hash()) :
+		buckets(num_buckets), hasher(hasher_)
+	{
+		for (unsigned i = 0; i<num_buckets; ++i)
+		{
+			buckets[i].reset(new bucket_type);
+		}
+	}
+
+	threadsafe_lookup_table(threadsafe_lookup_table const& other) = delete;
+	threadsafe_lookup_table& operator=(threadsafe_lookup_table const& other) = delete;
+
+	Value value_for(Key const& key, Value const& default_value = Value()) const
+	{
+		return get_bucket(key).value_for(key, default_value);
+	}
+
+	void add_or_update_mapping(Key const& key, Value const& value)
+	{
+		get_bucket(key).add_or_update_mapping(key, value);
+	}
+
+	void remove_mapping(Key const& key)
+	{
+		get_bucket(key).remove_mapping(key);
+	}
+
+	std::map<Key, Value> get_map() const
+	{
+		std::vector<std::unique_lock<boost::shared_mutex> > locks;
+		for (unsigned i = 0; i<buckets.size(); ++i)
+		{
+			locks.push_back(
+				std::unique_lock<boost::shared_mutex>(buckets[i]->mutex));
+		}
+		std::map<Key, Value> res;
+		for (unsigned i = 0; i<buckets.size(); ++i)
+		{
+			for (auto it = buckets[i]->data.begin();
+				it != buckets[i]->data.end();
+				++it)
+			{
+				res.insert(*it);
+			}
+		}
+		return res;
+	}
+
+	std::vector<Key> get_Key() const
+	{
+		std::vector<std::unique_lock<boost::shared_mutex> > locks;
+		for (unsigned i = 0; i<buckets.size(); ++i)
+		{
+			locks.push_back(
+				std::unique_lock<boost::shared_mutex>(buckets[i]->mutex));
+		}
+		std::vector<Key> res;
+		for (unsigned i = 0; i<buckets.size(); ++i)
+		{
+			for (auto it = buckets[i]->data.begin();
+				it != buckets[i]->data.end();
+				++it)
+			{
+				res.push_back(it->first);
+			}
+		}
+		return res;
+	}
+};
 ```
 
 测试代码如下：
@@ -2228,4 +2365,175 @@ int main()
 8
 9
 
+```
+
+#### Writing a thread-safe list using locks
+
+支持STL类型迭代器的基本问题是：这个迭代器必须持有这个容器内部数据结构的一些类型的引用。如果该容器能被另外的线程修改，该引用又必须保持在可用状态，那么就需要这个迭代器持有该数据结构一些部分的锁了。
+
+让迭代器的生命周期完全脱离容器的控制是非常糟糕的，替代方案是使用像`for_each`一样的迭代函数来作为容器的一部分。这样就能让容器一直负责迭代和锁定，但是也违反了避免死锁的建议，因为为了让`for_each`做事，就必须调用在持有锁的情况下调用用户代码，这可能造成死锁；另外你还必须传递元素的引用到这个用户代码，这是非常危险的，因为用户代码可以将这个引用传递到外面，然后做什么事就脱离了掌控，继而可能造成条件竞争，你可以传递拷贝，但如果数据比较复杂，代价就会非常昂贵。但是你可以把这个问题交给用户，让它保证不会造成死锁，也不会存储引用，这是非常安全的，因为你知道你不会做一些淘气的事情。
+
+剩下的就是你需要为你的list提供哪些操作了。上面的示例包含了以下五个操作：
+
+*	添加一个元素；
+*	移除一个元素；
+*	查找一个元素；
+*	更新一个元素；
+*	拷贝每个元素到另一个容器。
+
+细粒度锁list的基本思想是为每个node设置一个mutex，如果list太大，就会有好多好多mutex！这个优点就是不同list部分的操作是真正并发的：每个操作持有它感兴趣的node的锁，然后离开时解锁。
+
+```c++
+#pragma once
+
+// 一个线程安全的细粒度锁链表的简单实现
+#include <mutex>
+
+template<typename T>
+class threadsafe_list
+{
+	struct node
+	{
+		std::mutex m;
+		std::shared_ptr<T> data;
+		std::unique_ptr<node> next;
+
+		node() :
+			next()
+		{}
+
+		node(T const& value) :
+			data(std::make_shared<T>(value))
+		{}
+	};
+
+	node head;
+
+public:
+	threadsafe_list()
+	{}
+
+	~threadsafe_list()
+	{
+		remove_if([](node const&) {return true; });
+	}
+
+	threadsafe_list(threadsafe_list const& other) = delete;
+	threadsafe_list& operator=(threadsafe_list const& other) = delete;
+
+	void push_front(T const& value)
+	{
+		std::unique_ptr<node> new_node(new node(value));
+		std::lock_guard<std::mutex> lk(head.m);
+		new_node->next = std::move(head.next);
+		head.next = std::move(new_node);
+	}
+
+	template<typename Function>
+	void for_each(Function f)
+	{
+		node* current = &head;
+		std::unique_lock<std::mutex> lk(head.m);
+		while (node* const next = current->next.get())
+		{
+			std::unique_lock<std::mutex> next_lk(next->m);
+			lk.unlock();
+			f(*next->data);
+			current = next;
+			lk = std::move(next_lk);
+		}
+	}
+
+	template<typename Predicate>
+	std::shared_ptr<T> find_first_if(Predicate p)
+	{
+		node* current = &head;
+		std::unique_lock<std::mutex> lk(head.m);
+		while (node* const next = current->next.get())
+		{
+			std::unique_lock<std::mutex> next_lk(next->m);
+			lk.unlock();
+			if (p(*next->data))
+			{
+				return next->data;
+			}
+			current = next;
+			lk = std::move(next_lk);
+		}
+		return std::shared_ptr<T>();
+	}
+
+	template<typename Predicate>
+	void remove_if(Predicate p)
+	{
+		node* current = &head;
+		std::unique_lock<std::mutex> lk(head.m);
+		while (node* const next = current->next.get())
+		{
+			std::unique_lock<std::mutex> next_lk(next->m);
+			if (p(*next->data))
+			{
+				std::unique_ptr<node> old_next = std::move(current->next);
+				current->next = std::move(next->next);
+				next_lk.unlock();
+			}
+			else
+			{
+				lk.unlock();
+				current = next;
+				lk = std::move(next_lk);
+			}
+		}
+	}
+};
+```
+
+由于所有锁都是从head开始，按顺序进行lock的，所以不会有deadlock的危险；在`remove_if`函数中，如果删除的node正在被其他线城使用，就会造成条件竞争，但是由于该函数在删除的时候并没有unlock上一个node，所以正在删除的node是不可能被访问的；还是在`remove_if`函数中，下面的删除操作不能被替换为`current->next.reset(next->next.release())`，因为`next = current->next.get()`，如果先将`current->next`释放，那么next就是被删除的指针，继续使用会造成未定义行为，先将其转移到一个局部变量，然后将下一个node的指向赋给上一个`node.next`，最后该局部变量在生命周期结束时会自动释放。
+
+```c++
+std::unique_ptr<node> old_next = std::move(current->next);
+current->next = std::move(next->next);
+```
+
+测试程序：
+
+```c++
+#include <iostream>
+#include <cstdlib>
+#include <thread>
+
+#include "myLinkedList.h"
+
+threadsafe_list<int> g_linked_lsit;
+
+void add_data()
+{
+	int loop_count = 10;
+	for (int i = 0; i < loop_count; ++i)
+	{
+		g_linked_lsit.push_front(i);
+	}
+}
+
+void print_data()
+{
+	g_linked_lsit.for_each(
+		[](const int& i) 
+	{std::cout << i << std::ends; });
+}
+
+int main()
+{
+	auto t1 = std::thread(add_data);
+	auto t2 = std::thread(print_data);
+
+	t1.join();
+	t2.join();
+}
+```
+
+测试结果：
+
+```text
+9 8 7 6 5 4 3 2 1 0
 ```
