@@ -2591,9 +2591,223 @@ compare/exchange操作经常被用在循环里面，之所以用compare/exchange
 由于正确的获得一个无锁或无等待的数据结构的困难性，你**必须确保得到的好处超过了成本**：
 
 *	使用无锁数据结构的最主要原因是获得最大的并发性能，**使用无锁数据结构时，每个线程都能向前进而不管其它线程在做什么，也不需要等待**，这样的功能谁都想要，但是却很难实现，最终得到像spin lock那样的数据结构太容易了；
-*	使用无锁数据结构的第二个原因是鲁棒性(robustness)，如果你个线程在持有锁时被销毁，那么这个数据结构就永远损坏了，但如果使用的是无锁数据结构，那么损坏的就只有那个线程的数据了，其他线程可以正常运行；
+*	使用无锁数据结构的第二个原因是鲁棒性(robustness)，如果一个线程在持有锁时被销毁，那么这个数据结构就永远损坏了，但如果使用的是无锁数据结构，那么损坏的就只有那个线程的数据了，其他线程可以正常运行；
 *	如果你不能排除其它线程访问数据结构，那么你就要小心维护不变量，为了避免条件竞争(race condition)，你必须使用原子操作来修改数据，除此之外，你还必须确保修改以正确的顺序显示给其它线程；
-*	因为没有锁，所以无锁数据结构不会造成dead lock，但是可能造成live lock：想象当两个线程都想要修改数据，但是任何一个线程所做的操作都会导致两一个线程的操作重新执行，所以两个线程会一直循环尝试。就像两个人同时从两边过一个独木桥，必须要一方通过之后，另一方才能继续通过。就定义上来讲，无等待数据结构是不会造成live lock的，因为它们执行操作的步骤总是有上限的，但换个角度讲，无等待算法要比等待算法复杂度高，且就算没有其它线程访问数据也会需要更多的步骤来完成对应操作。
+*	因为没有锁，所以无锁数据结构不会造成dead lock，但是可能造成live lock：想象当两个线程都想要修改数据，但是任何一个线程所做的操作都会导致另一个线程的操作重新执行，所以两个线程会一直循环尝试。就像两个人同时从两边过一个独木桥，必须要一方通过之后，另一方才能继续通过。就定义上来讲，无等待数据结构是不会造成live lock的，因为它们执行操作的步骤总是有上限的，但换个角度讲，无等待算法要比等待算法复杂度高，且就算没有其它线程访问数据也会需要更多的步骤来完成对应操作。
 *	尽管无锁或无等待数据结构可以增加并发操作的潜力，并减少线程花费等待的时间，但它可能会降低整体性能。因为原子操作可能比非原子操作慢得多，并且无锁数据结构的操作相对于使用锁的数据结构的操作要更多；不仅如此，硬件必须在访问相同原子变量的线程之间同步数据。
 
 <h3 id="examples_of_lock_free_data_structures">无锁数据结构示例</h3>
+
+无锁数据结构依赖于原子操作，及其关联的memory order，用以确保数据以正确的顺序被其他线程看到。刚开始我们会使用默认的memory order--`memory_order_seq_cst`，然后会用`memory_order_acquire`、`memory_order_release`、甚至`memory_order_relaxed`来减少一些顺序的限制。**虽然这些示例都没有直接使用mutex，但是只有`std::atomic_flag`保证其实现不会使用mutex**。在一些环境中，无锁数据结构可能实际上使用的是内部锁实现的，在这种情况下，使用有锁数据结构可能会更加适合，总之：在选择实现方式时，你需要确认自己的需求，并配置复合这些要求的各种选项。
+
+#### Writing a thread-safe stack without locks
+
+stack的基本前提是相对简单的：last in, first out(LIFO)。所以有一件事是非常重要的：一旦一个值被添加到stack，那么它可以马上被其他线程安全的获取，且只能有一个线程获取到。
+
+最简单的stack使用linked list实现的：head指针指向第一个节点，然后`head->next`指向下一个节点。添加一个节点在单线程中需要做以下操作：
+
+*	创建一个新节点；
+*	设置该新节点的next到当前head；
+*	更新head，使其指向该新节点。
+
+该操作在单线程中是没有问题的，但是如果有两个线程同时在添加节点，那么步骤2和步骤3之间就可能有条件竞争，在当前线程做完步骤2后，开始步骤3前，也许其它线程已经修改了head指向，那么其他线程添加的节点就失去了指向(稍微画个图就明白了)，就像被丢弃了一样，但是可能因为没有被释放，会一直占用着内存。解决方案就是：在步骤3中使用原子compare/exchange操作，用以确保步骤2读取到的head没有被修改，如果其被修改了，那么重新开始。
+
+```c++
+template<typename T>
+class lock_free_stack
+{
+private:
+	struct node
+	{
+		T data;
+		node* next;
+		node(T const& data_) :
+			data(data_)
+		{}
+	};
+	std::atomic<node*> head;
+
+public:
+	void push(T const& data)
+	{
+		node* const new_node = new node(data);
+		new_node->next = head.load();
+		// 若new_node->next与head.load()相等，则head被赋值为new_node，循环结束
+		// 否则，new_node->next被赋值为head.load()，再次循环
+		// 使用weak而非strong是因为前者在某些架构上能使代码更加优化
+		while (!head.compare_exchange_weak(new_node->next, new_node));
+	}
+};
+```
+
+上面唯一可能发生异常的地方是`new node`，但是这并不影响这个数据结构，因为它并没有修改任何节点；由于没有lock，也不会有deadlock的危险；条件竞争(race condition)也用compare/exchange解决了。所以现在我们有了一个安全的无锁的向stack添加数据的接口了，接下来我们需要设计一个pop接口。在单线程中，pop的步骤如下：
+
+*	读取当前head；
+*	读取`head->next`；
+*	更新head，使其指向`head->next`；
+*	返回获取到的节点的数据；
+*	删除获取的节点。
+
+还是老问题，如果有两个线程同时pop，那么这两个线程在步骤1可能读取到相同的head，如果其中一个线程A在另一个线程B执行步骤2前就完成了所有步骤，那么此时B读取到的head就是被删除的指针，继续使用将会造成未定义行为，所以我们先不删除节点。另一个问题是：A和B读取到的是相同的head，那么它们会返回相同的节点数据，这是违反stack的意图的。你可以用在push中相同的方法来解决这个问题，那就是使用compare/exchange操作：使用compare/exchange来更新head，如果失败了，要么是有一个新的节点被push了，要么就是另一个线程pop了你想pop的节点，不管哪个原因，你需要返回step1重新开始；如果成功了那么你就是唯一一个执行pop操作的线程，你可以安全的执行step4。
+
+```c++
+void pop(T& result)
+{
+	node* old_head = head.load();
+	while (!head.compare_exchange_weak(old_head, old_head->next));
+	result = old_head->data;
+}
+```
+
+上面的代码虽然看起来简洁又nice，但是还是有节点泄露的问题：
+
+*	首先，当列表为空时，pop是不能工作的，因为此时`head.load()`是nullptr，使用其next会造成未定义行为，你可以在一个while中循环检测nullptr，或者抛出一个`empty stack`异常，或者返回一个bool值用以指示成功或失败；
+*	第二个问题是异常安全问题，在[基础篇](https://chorior.github.io/2017/04/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%9F%BA%E7%A1%80%E7%AF%87/#api_design_with_mutex)我们讲过，直接返回值如果发生异常的话，那么原值就会丢失，在这种情况下，传入引用是一个可选的方法，你可以确保在异常发生时，stack的值保持不变，然而不幸的是，你不能这么做，你只能在你知道自己是唯一一个返回该节点的情况下才能安全的复制数据，这意味着该节点已经被stack移除了，因此传入引用没有任何优势，直接返回也是可以的。如果你想安全的返回值，你可以选择返回一个智能指针，nullptr用来指明没有值可以返回，但是数据也需要内存分配，这也可能发生异常，你可以将内存分配放到push中去。
+
+```c++
+template<typename T>
+class lock_free_stack
+{
+private:
+	struct node
+	{
+		std::shared_ptr<T> data;
+		node* next;
+		node(T const& data_) :
+			data(std::make_shared<T>(data_))
+		{}
+	};
+	std::atomic<node*> head;
+
+public:
+	void push(T const& data)
+	{
+		node* const new_node = new node(data);
+		new_node->next = head.load();
+		while (!head.compare_exchange_weak(new_node->next, new_node));
+	}
+
+	std::shared_ptr<T> pop()
+	{
+		node* old_head = head.load();
+		while (old_head &&
+			!head.compare_exchange_weak(old_head, old_head->next));
+		return old_head ? old_head->data : std::shared_ptr<T>();
+	}
+};
+```
+
+上面的代码将data数据类型修改为了`std::shared_ptr`，pop中也检查了head为空的情况。整个数据结构时无锁但却不是无等待的，因为两个while可能一直在循环。
+
+#### Stopping those pesky leaks: managing memory in lock-free data structures
+
+众所周知，C++是没有像java或C#那样的垃圾回收机制的，所以你需要自己清理pop中的`old_head`。但是**在确定没有其他线程在使用该指针前，你是不能做delete操作的**。push一旦将节点添加到stack之后，就不再与该节点有任何关系了，所以pop肯定是唯一一个可以接触节点并安全删除节点的线程。
+
+另一方面，如果你需要处理多个线程对同一个stack调用pop的情况，那么你需要一些方法来跟踪什么时候删除节点是安全的。这实际上意味着你需要为节点写一个专用的垃圾回收器，这听起来可能有些恐怖，实际上也相当棘手，但并不是那么糟糕：你仅仅只需要检查pop访问的节点，push中的节点你并不需要担心，因为直到节点被添加到stack，push中的节点只有它一个线程能访问。
+
+如果没有线程在调用pop，删除所有待删除的节点是绝对安全的。因此，当你提取完数据之后，你可以将节点添加到“待删除”列表，然后等待没有线程在调用pop时将它们全部删除。很显然，你如何才能知道没有线程在调用pop呢，很简单，在pop里添加一个计数器即可：进入时递增计数器，退出时递减计数器。当然该计数器也必须是原子的，使用整型原子变量就可以担此大任。
+
+```c++
+template<typename T>
+class lock_free_stack
+{
+private:
+	struct node
+	{
+		std::shared_ptr<T> data;
+		node* next;
+		node(T const& data_) :
+			data(std::make_shared<T>(data_))
+		{}
+	};
+	std::atomic<node*> head;
+	std::atomic<unsigned> threads_in_pop;
+	std::atomic<node*> to_be_deleted;
+
+	static void delete_nodes(node* nodes)
+	{
+		while (nodes)
+		{
+			node* next = nodes->next;
+			delete nodes;
+			nodes = next;
+		}
+	}
+
+	void try_reclaim(node* old_head)
+	{
+		// 当前只有你一个线程在调用pop，可以安全的删除old_head和待删除的节点
+		if (threads_in_pop == 1)
+		{
+			// exchange: 交换存储的值与传入的值，返回交换后传入的值
+			node* nodes_to_delete = to_be_deleted.exchange(nullptr);
+
+			// 如果threads_in_pop递减之后为0，那么意味着没有其它线程可以访问待删除节点列表
+			if (!--threads_in_pop)
+			{
+				delete_nodes(nodes_to_delete);
+			}
+			// 如果threads_in_pop递减之后不为0，那么需要将交换出来的节点重新放回到待删除列表
+			else if (nodes_to_delete)
+			{
+				chain_pending_nodes(nodes_to_delete);
+			}
+			delete old_head;
+		}
+		// 若当前不止你一个线程在调用pop，那么将old_head添加到待删除列表
+		else
+		{
+			chain_pending_node(old_head);
+			--threads_in_pop;
+		}
+	}
+
+	void chain_pending_nodes(node* nodes)
+	{
+		node* last = nodes;
+		while (node* const next = last->next)
+		{
+			last = next;
+		}
+		chain_pending_nodes(nodes, last);
+	}
+
+	void chain_pending_nodes(node* first, node* last)
+	{
+		last->next = to_be_deleted;
+		while (!to_be_deleted.compare_exchange_weak(
+			last->next, first));
+	}
+
+	void chain_pending_node(node* n)
+	{
+		chain_pending_nodes(n, n);
+	}
+
+public:
+	void push(T const& data)
+	{
+		node* const new_node = new node(data);
+		new_node->next = head.load();
+		while (!head.compare_exchange_weak(new_node->next, new_node));
+	}
+
+	std::shared_ptr<T> pop()
+	{
+		++threads_in_pop;
+		node* old_head = head.load();
+		while (old_head &&
+			!head.compare_exchange_weak(old_head, old_head->next));
+		std::shared_ptr<T> res;
+		if (old_head)
+		{
+			// 使用swap会将传入参数的所有权移交到调用者，现在old_head可以随意删除了
+			res.swap(old_head->data);
+		}
+		try_reclaim(old_head); // threads_in_pop在这里递减
+		return res;
+	}
+};
+```
+
+无锁数据结构太难了，上面是最简单的数据结构，还没设计完！其实后面还有一些分析，你可以自行查看《C++ Concurrency in Action》7.2.2节及其后面的内容。我自认为如果让我自己构建的话，我是绝对想不到这么多的，在工作中需要经常调试又很难找出错误的代码是不允许出现的，我还是比较适合带锁的数据结构，当然这只是安慰自己的借口而已，后面会跳过无锁数据结构的设计，开始并发代码设计、管理和调试的学习！
