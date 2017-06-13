@@ -16,6 +16,7 @@ tags:
 	*	[基于数据的工作划分](#data_based_work_division)
 	*	[基于任务类型的工作划分](#task_type_based_work_division)
 	*	[影响并发代码性能的因素](#factors_affecting_the_performance_of_concurrent_code)
+	*	[为多线程性能设计数据结构](#designing_data_structures_for_multithreaded_performance)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -397,8 +398,24 @@ void processing_loop_with_mutex()
 }
 ```
 
-如何避免“乒乓缓存”(cache ping-pong)呢？答案很好地与改善并发潜力的一般准则相联系：**尽可能减少两个线程竞争同一内存位置的潜力(do what you can to reduce the potential for two threads competing for the same memory location)**。然而即使某个内存位置只能由一个线程访问，由于伪共享(false sharing)的原因，你仍然能够获得“乒乓缓存”(cache ping-pong)。
+如何避免“乒乓缓存”(cache ping-pong)呢？答案很好地与改善并发潜力的一般准则相联系：**尽可能减少两个线程竞争同一内存位置(memory location)的潜力(do what you can to reduce the potential for two threads competing for the same memory location)**。然而即使某个内存位置只能由一个线程访问，由于伪共享(false sharing)的原因，你仍然能够获得“乒乓缓存”(cache ping-pong)。
 
 #### False sharing
 
-处理器缓存通常不会用来处理在单个内存位置，但其会用来处理称为缓存行(cache lines)的内存块。
+**处理器缓存通常不会用来处理在单个内存位置(memory location)，但其会用来处理称为高速缓存行(cache line)的内存块**。这些内存块大小通常为32或64字节，但具体细节取决于所使用的特定处理器型号。由于高速缓存硬件仅在高速缓存行(cache line)大小的内存块中进行处理，所以相邻内存位置(memory location)中的小数据项将位于相同的高速缓存行(cache line)中。有时候这是很好的：如果线程访问的数据集在同一个cache line中，那么程序性能会比数据集分布多个cache line中要好。然而，如果cache line中的数据项是不相关的，且需要被不同线程访问，这就会导致一个主要的性能问题。
+
+假设你有一个int数组和一个线程集，每个线程都访问数组中的自己的条目，但重复执行，包括更新。由于int通常比缓存行小得多，所以相当数量的条目将在同一个cache line中，所以即使每个线程只访问自己的数组条目，但仍然发生了“乒乓缓存”(cache ping-pong)：每次访问条目0的线程A需要更新值时，需要将cache line的所有权传输到运行A的处理器，当访问条目1的线程B需要更新值时，cache line的所有权又被传输到运行B的处理器。虽然没有数据是共享的，但是cache line却是共享的，这就是术语false sharing的由来。这里的解决方案是**结构化数据，使得同一线程要访问的数据项在内存中相互靠近（从而更可能在同一个cache line中），而不同线程访问的数据项在内存中相互远离，因此更有可能在单独的cache line中**。
+
+#### How close is your data?
+
+false sharing是由于一个线程访问的数据太靠近另一个线程访问的数据引起的；另一个与数据布局相关的问题是数据接近度(proximity)：如果一个线程的访问的数据在内存中散列分布，那么这些数据很可能位于不同的cache line上，反之，如果数据在内存中相互靠近，那么这些数据就更可能位于相同的cache line上。所以，**如果数据散列分布，就需要将更多的cache line加载到处理器缓存上，这会增加内存的访问延迟，并且降低性能**。另外，如果数据散列分布，那么cache line中就会有更大的可能包含其它线程访问的数据，极端情况下，你所需要的数据甚至比你不关心的数据要少；这将浪费宝贵的缓存空间，从而增加处理器未命中的概率。
+
+如果线程数量多于内核或处理器数量，操作系统可能会选择将一个线程安排给这个内核一段时间，之后再安排给另一个内核一段时间，这就需要将cache line从一个内核上转移到另一个内核上；**转移的cache line越多，耗费的时间就越多**。虽然操作系统尽量避免这样的情况发生，不过当其发生的时候，就会对性能有很大的影响。
+
+#### Oversubscription and excessive task switching
+
+**在多线程系统中，线程数通常比处理器数要多，除非你使用的是大型并发系统**。然而线程经常花费时间等待外部I/O、或等待mutex、或等待条件变量等等，所以拥有额外的线程使得程序能够执行有用的工作，而不是让处理器在等待时处于空闲状态。但是当线程数太多，以致等待运行的线程数超过了可用的处理器数时，系统就会开始任务切换，这也会增加时间开销，当一个任务重复产生新线程而不受控制时，可能会出现超额认购(oversubscription)。
+
+<h3 id="designing_data_structures_for_multithreaded_performance">为多线程性能设计数据结构</h3>
+
+**为多线程性能设计数据结构的关键点在于：竞争(contention)、伪共享(false sharing)、数据接近度(proximity)**。这三个点都能对性能造成巨大的影响，你通常可以修改数据布局、或更改为每个线程分配的数据来改善你的代码。
