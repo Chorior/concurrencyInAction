@@ -419,3 +419,40 @@ false sharing是由于一个线程访问的数据太靠近另一个线程访问�
 <h3 id="designing_data_structures_for_multithreaded_performance">为多线程性能设计数据结构</h3>
 
 **为多线程性能设计数据结构的关键点在于：竞争(contention)、伪共享(false sharing)、数据接近度(proximity)**。这三个点都能对性能造成巨大的影响，你通常可以修改数据布局、或更改为每个线程分配的数据来改善你的代码。
+
+#### Dividing array elements for complex operations
+
+假设你需要对两个超大的矩阵进行相乘，我们知道矩阵的乘法如下：
+
+```text
+如果 AB = C，其中A、B、C都是矩阵
+那么 Cij = Ai0*B0j + Ai1*B1j + Ai2*B2j + ...
+```
+
+假设这两个超大的矩阵拥有上千行、上千列，那么使用多线程可以优化该乘法。通常，非稀疏矩阵在内存中用一个大数组表示，第二行的所有元素跟随在第一行的所有元素之后，以此类推。为了做矩阵乘法，你需要三个这样的大数组，两个用于相乘，一个用于结果。
+
+你可以使用多种方法来划分工作。如果你的行列数超过了可用的处理器数，那么你可以让每个线程计算一定数量的结果元素，可以是几行、几列、或者一个子矩阵，都没问题。但是我们知道，**访问连续的元素会比访问分散的元素要好**，因为前者会减少缓存的使用量和false sharing的概率。
+
+现在假设第一个矩阵A是N行M列，第二个矩阵B是M行K列，且每行元素使用一个cache line。如果每个线程计算结果C的一行元素，那么一个线程使用的cache line数为1+M+1，其中只有对B的数据的访问是分散的，各个线程使用的A和C的cache line都是不同的；如果每个线程计算结果C的一列元素，那么一个线程使用的cache line数为N+M+N，各个线程使用的cache line都是一样的，这不仅会增加缓存的使用量，还会增加false sharing的概率；如果每个线程计算结果C的一个PxQ子矩阵元素，那么一个线程使用的cache line数为P+Q+P，各个线程使用的cache line可能相同，但相对于第一种方法，可能会减少缓存的使用量。
+
+考虑两个1000x1000的矩阵相乘，你有100个处理器。如果每个处理器处理结果的10行元素，那么需要访问第一个矩阵的10x1000个元素，第二个矩阵的1000x1000个元素，结果矩阵的10x1000个元素，一共需要访问1020000个元素；如果每个处理器处理结果的100x100子矩阵元素，那么需要访问第一个矩阵的100x1000个元素，第二个矩阵的100x1000个元素，结果矩阵的100x100个元素，一共需要访问210000个元素，是处理10行元素访问元素的五分之一，所以会更好的提升性能。
+
+**将工作划分为小块可能会工作的更好，你可以根据源矩阵的大小和处理器的数量来动态的对块的大小进行调整**。
+
+也许你在想这个例子到底是想说什么？答案就是：**很多情况下，你并不需要修改基本算法，你只需要简单的修改划分方式就能很好的提升性能了**。
+
+#### Data access patterns in other data structures
+
+从根本上来讲，当你尝试优化其它数据结构的数据访问模式时，需要考虑的与上面的数组差不多：
+
+*	尝试调整数据在线程间的分布，使得同一线程使用的数据相互靠近；
+*	尝试最小化每个线程的数据量；
+*	尝试确保不同线程使用的数据相互远离，以避免false sharing。
+
+>Of course, that’s not easy to apply to other data structures. For example, binary trees are inherently difficult to subdivide in any unit other than a subtree, which may or may not be useful, depending on how balanced the tree is and how many sections you need to divide it into. Also, the nature of the trees means that the nodes are likely dynamically allocated and thus end up in different places on the heap.
+>
+>
+>Now, having data end up in different places on the heap isn’t a particular problem in itself, but it does mean that the processor has to keep more things in cache. This can actually be beneficial. If multiple threads need to traverse the tree, then they all need to access the tree nodes, but if the tree nodes only contain pointers to the real data held at the node, then the processor only has to load the data from memory if it’s actually needed. If the data is being modified by the threads that need it, this can avoid the performance hit of false sharing between the node data itself and the data that provides the tree structure.
+>
+>
+>There’s a similar issue with data protected by a mutex. Suppose you have a simple class that contains a few data items and a mutex used to protect accesses from multiple threads. If the mutex and the data items are close together in memory, this is ideal for a thread that acquires the mutex; the data it needs may well already be in the processor cache, because it was just loaded in order to modify the mutex. But there’s also a downside: if other threads try to lock the mutex while it’s held by the first thread, they’ll need access to that memory. Mutex locks are typically implemented as a readmodify-write atomic operation on a memory location within the mutex to try to acquire the mutex, followed by a call to the operating system kernel if the mutex is already locked. This read-modify-write operation may well cause the data held in the cache by the thread that owns the mutex to be invalidated. As far as the mutex goes, this isn’t a problem; that thread isn’t going to touch the mutex until it unlocks it. However, if the mutex shares a cache line with the data being used by the thread, the thread that owns the mutex can take a performance hit because another thread tried to lock the mutex!
