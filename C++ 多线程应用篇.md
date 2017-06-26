@@ -17,6 +17,7 @@ tags:
 	*	[基于任务类型的工作划分](#task_type_based_work_division)
 	*	[影响并发代码性能的因素](#factors_affecting_the_performance_of_concurrent_code)
 	*	[为多线程性能设计数据结构](#designing_data_structures_for_multithreaded_performance)
+	*	[多线程设计时的其它注意事项](#additional_considerations_when_designing_for_concurrency)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -456,3 +457,127 @@ false sharing是由于一个线程访问的数据太靠近另一个线程访问�
 >
 >
 >There’s a similar issue with data protected by a mutex. Suppose you have a simple class that contains a few data items and a mutex used to protect accesses from multiple threads. If the mutex and the data items are close together in memory, this is ideal for a thread that acquires the mutex; the data it needs may well already be in the processor cache, because it was just loaded in order to modify the mutex. But there’s also a downside: if other threads try to lock the mutex while it’s held by the first thread, they’ll need access to that memory. Mutex locks are typically implemented as a readmodify-write atomic operation on a memory location within the mutex to try to acquire the mutex, followed by a call to the operating system kernel if the mutex is already locked. This read-modify-write operation may well cause the data held in the cache by the thread that owns the mutex to be invalidated. As far as the mutex goes, this isn’t a problem; that thread isn’t going to touch the mutex until it unlocks it. However, if the mutex shares a cache line with the data being used by the thread, the thread that owns the mutex can take a performance hit because another thread tried to lock the mutex!
+
+<h3 id="additional_considerations_when_designing_for_concurrency">多线程设计时的其它注意事项</h3>
+
+虽然我们已经讨论了很多并发设计需要注意的事项，但是作为一个好的并发代码。还需要考虑异常安全和可扩展性(scalability)。**如果一段代码的性能随着内核数量的增加而增加(一般呈线性趋势，即100个内核运行该代码的性能是一个内核运行该代码的性能的100倍)，那么称该代码是可扩展的(scalable)**。单线程代码一定不是可扩展的。
+
+#### 并发算法中的异常安全
+
+异常安全是一个好代码必不可少的部分，并发代码也不例外，**实际上并发算法比一般的序列算法更需要注意异常安全**。
+
+如果一个序列算法抛出异常，它只需要考虑自身资源的清理以及异常的处理，它也可以传回给调用者让调用者进行处理；但是并发算法中很多操作都是在不同线程中的，所以异常是不允许传回给调用者的，因为它们在一个错误的调用栈中。如果一个新线程中的函数异常退出，那么应用程序将会终止(terminate)。
+
+查看如下代码：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+template<typename Iterator, typename T>
+struct accumulate_block
+{
+	void operator()(Iterator first, Iterator last, T& result)
+	{
+		// 注意std::accumulate第三个参数是值传递
+		result = std::accumulate(first, last, result);
+	}
+};
+
+template<typename Iterator, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init)
+{
+	unsigned long const length = std::distance(first, last);
+	if (!length)
+		return init;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+
+	unsigned long const block_size = length / num_threads;
+	std::vector<T> results(num_threads);
+	std::vector<std::thread> threads(num_threads - 1);
+
+	Iterator block_start = first;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		Iterator block_end = block_start;
+		std::advance(block_end, block_size);
+		threads[i] = std::thread(
+			accumulate_block<Iterator, T>(),
+			block_start, block_end, std::ref(results[i]));
+		block_start = block_end;
+	}
+	accumulate_block<Iterator, T>()(block_start, last, results[num_threads - 1]);
+
+	// std::mem_fn生成一个包装对象的成员函数的指针，在C++14中被移除
+	/*std::for_each(threads.begin(), threads.end(),
+		std::mem_fn(&std::thread::join));*/
+
+	for (unsigned i = 0; i < threads.size(); ++i)
+	{
+		threads[i].join();
+	}
+	
+	return std::accumulate(results.begin(), results.end(), init);
+}
+
+int main()
+{
+	// 随机数生成
+	std::vector<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 10000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+
+	int sum1 = 0, sum2 = 0;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	accumulate_block<decltype(begin),int>()(begin, end, sum1);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "accumulate_block tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	sum2 = parallel_accumulate<decltype(begin), int>(begin, end, sum2);
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_accumulate tooks " 
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	std::cout << "sum1 = " << sum1
+		<< ", sum2 = " << sum2
+		<< std::endl;
+}
+```
+
+结果：
+
+```text
+accumulate_block tooks 0.260436 ms
+parallel_accumulate tooks 0.851227 ms
+sum1 = 5026673, sum2 = 5026673
+
+```
+
+**当你调用一个你知道的可能会发生异常的函数，或者调用了一个用户自定义的函数时，可能发生异常**：
+
+*	在`block_start`初始化之前的所有操作都是异常安全的，因为你除了初始化之外什么也没有做，而且这些操作全部都在调用线程上运行。
+*	一旦创建的线程发生了异常，由于thread的析构函数在没有调用`detach`或`join`的情况下会调用`terminate`，所以程序将会终止；
+*	在`accumulate_block`中的`std::accumulate`也可能抛出异常，因为没有做catch处理。
