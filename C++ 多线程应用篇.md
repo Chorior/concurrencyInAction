@@ -18,6 +18,8 @@ tags:
 	*	[影响并发代码性能的因素](#factors_affecting_the_performance_of_concurrent_code)
 	*	[为多线程性能设计数据结构](#designing_data_structures_for_multithreaded_performance)
 	*	[多线程设计时的其它注意事项](#additional_considerations_when_designing_for_concurrency)
+	*	[多线程改善响应能力](#improving_responsiveness_with_concurrency)
+	*	[多线程代码设计实战](#designing_concurrent_code_in_practice)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -581,3 +583,484 @@ sum1 = 5026673, sum2 = 5026673
 *	在`block_start`初始化之前的所有操作都是异常安全的，因为你除了初始化之外什么也没有做，而且这些操作全部都在调用线程上运行。
 *	一旦创建的线程发生了异常，由于thread的析构函数在没有调用`detach`或`join`的情况下会调用`terminate`，所以程序将会终止；
 *	在`accumulate_block`中的`std::accumulate`也可能抛出异常，因为没有做catch处理。
+
+在基础篇我们知道，`std::future`是可以存储异常的，所以我们用`std::future`来重构上面的代码：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+template<typename Iterator, typename T>
+struct accumulate_block
+{
+	T operator()(Iterator first, Iterator last)
+	{
+		return std::accumulate(first, last, T());
+	}
+};
+
+template<typename Iterator, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init)
+{
+	unsigned long const length = std::distance(first, last);
+
+	if (!length)
+		return init;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+
+	unsigned long const block_size = length / num_threads;
+
+	std::vector<std::future<T> > futures(num_threads - 1);
+	std::vector<std::thread> threads(num_threads - 1);
+
+	Iterator block_start = first;
+	T last_result = 0;
+	try
+	{
+		for (unsigned long i = 0; i<(num_threads - 1); ++i)
+		{
+			Iterator block_end = block_start;
+			std::advance(block_end, block_size);
+			// !!!!!!特别注意，如果参数不加括号会被当做函数声明，你也可以使用{}来初始化
+			std::packaged_task<T(Iterator, Iterator)> task(
+				(accumulate_block<Iterator, T>()));
+			futures[i] = task.get_future();
+			threads[i] = std::thread(std::move(task), block_start, block_end);
+			block_start = block_end;
+		}
+		last_result = accumulate_block<Iterator, T>()(block_start, last);
+
+		std::for_each(threads.begin(), threads.end(),
+			std::mem_fn(&std::thread::join));
+	}
+	catch (...)
+	{
+		for (unsigned long i = 0; i<(num_threads - 1); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+		throw; // throw之后，后面的代码将不再运行
+	}
+
+	T result = init;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		// 如果工作线程抛出异常，将在主线程的这里重新抛出
+		result += futures[i].get();
+	}
+	result += last_result;
+	return result;
+}
+
+int main()
+{
+	// 随机数生成
+	std::vector<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 10000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+
+	int sum1 = 0, sum2 = 0;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	sum1 = accumulate_block<decltype(begin), int>()(begin, end);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "accumulate_block tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		sum2 = parallel_accumulate<decltype(begin), int>(begin, end, sum2);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_accumulate tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	std::cout << "sum1 = " << sum1
+		<< ", sum2 = " << sum2
+		<< std::endl;
+}
+```
+
+结果如下：
+
+```text
+accumulate_block tooks 0.519273 ms
+parallel_accumulate tooks 1.22682 ms
+sum1 = 5026673, sum2 = 5026673
+
+```
+
+上面的`parallel_accumulate`函数的try-catch语句太丑了，而且你在正常控制语句和catch控制语句中写了重复的代码，这往往是不好的，因为如果你要修改的话就需要修改多个地方。C++ 处理这种问题的惯用方法是将重复的代码写在析构函数里：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+template<typename Iterator, typename T>
+struct accumulate_block
+{
+	T operator()(Iterator first, Iterator last)
+	{
+		return std::accumulate(first, last, T());
+	}
+};
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+template<typename Iterator, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init)
+{
+	unsigned long const length = std::distance(first, last);
+
+	if (!length)
+		return init;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+
+	unsigned long const block_size = length / num_threads;
+
+	std::vector<std::future<T> > futures(num_threads - 1);
+	std::vector<std::thread> threads(num_threads - 1);
+	join_threads joiner(threads);
+
+	Iterator block_start = first;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		Iterator block_end = block_start;
+		std::advance(block_end, block_size);
+		// !!!!!!特别注意，如果参数不加括号会被当做函数声明，你也可以使用{}来初始化
+		std::packaged_task<T(Iterator, Iterator)> task(
+			(accumulate_block<Iterator, T>()));
+		futures[i] = task.get_future();
+		threads[i] = std::thread(std::move(task), block_start, block_end);
+		block_start = block_end;
+	}
+	T last_result = accumulate_block<Iterator, T>()(block_start, last);
+
+	std::for_each(threads.begin(), threads.end(),
+		std::mem_fn(&std::thread::join));
+
+	T result = init;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		// 如果工作线程抛出异常，将在主线程的这里重新抛出
+		// 因为future.get()会阻塞直到其状态为ready，所以不用显式join
+		result += futures[i].get();
+	}
+	result += last_result;
+	return result;
+}
+
+int main()
+{
+	// 随机数生成
+	std::vector<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 10000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+
+	int sum1 = 0, sum2 = 0;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	sum1 = accumulate_block<decltype(begin), int>()(begin, end);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "accumulate_block tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		sum2 = parallel_accumulate<decltype(begin), int>(begin, end, sum2);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_accumulate tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	std::cout << "sum1 = " << sum1
+		<< ", sum2 = " << sum2
+		<< std::endl;
+}
+```
+
+结果如下：
+
+```text
+accumulate_block tooks 0.286739 ms
+parallel_accumulate tooks 0.853801 ms
+sum1 = 5026673, sum2 = 5026673
+
+```
+
+#### 使用`std::async`处理异常
+
+在[基础篇](https://chorior.github.io/2017/04/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%9F%BA%E7%A1%80%E7%AF%87/#functional_program_with_future)中，我们知道**`std::async`确保线程数不会过载**，所以`std::async`很适合用来做并发递归：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+template<typename Iterator, typename T>
+struct accumulate_block
+{
+	T operator()(Iterator first, Iterator last)
+	{
+		return std::accumulate(first, last, T());
+	}
+};
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+template<typename Iterator, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init)
+{
+	unsigned long const length = std::distance(first, last);
+	unsigned long const max_chunk_size = 25;
+	if (length <= max_chunk_size)
+	{
+		return std::accumulate(first, last, init);
+	}
+	else
+	{
+		Iterator mid_point = first;
+		std::advance(mid_point, length / 2);
+
+		// 如果async线程发生异常，在get()时会重新抛出
+		std::future<T> first_half_result =
+			std::async(parallel_accumulate<Iterator, T>,
+				first, mid_point, init);
+
+		// 如果这里抛出异常，future的析构函数会等待其线程完成
+		T second_half_result = parallel_accumulate(mid_point, last, T());
+		return first_half_result.get() + second_half_result;
+	}
+}
+
+int main()
+{
+	// 随机数生成
+	std::vector<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 10000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+
+	int sum1 = 0, sum2 = 0;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	sum1 = accumulate_block<decltype(begin), int>()(begin, end);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "accumulate_block tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		sum2 = parallel_accumulate<decltype(begin), int>(begin, end, sum2);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_accumulate tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	std::cout << "sum1 = " << sum1
+		<< ", sum2 = " << sum2
+		<< std::endl;
+}
+```
+
+结果：
+
+```text
+accumulate_block tooks 0.39162 ms
+parallel_accumulate tooks 39.3281 ms
+sum1 = 5026673, sum2 = 5026673
+
+```
+
+#### 可扩展性和 Amdahl 定律
+
+可扩展性就是你的代码利用处理器数量改善性能的能力，单线程代码永远不能利用处理器的数量。理想情况下，每个线程每时每刻都在做有用的工作，但实际上这是不可能的，因为**线程间经常花费时间相互等待或等待I/O操作完成**。
+
+一个简单的看待可扩展性的方法是：将程序划分为“串行”部分和“并行”部分，“串行”部分只有一个线程在做有用的工作，“并行”部分所有可用的处理器都在做有用的工作；所以如果程序运行在一个拥有较多处理器的系统上时，毫无疑问“并行”部分会完成的更加快速。假设“串行”部分占整个程序的比例为Fs，那么在带有N个处理器的系统上运行该程序的性能增益为：
+
+```c++
+P = 1/(Fs + (1 - Fs)/N)
+```
+
+上面的公式就是Amdahl 定律，**这个定律经常在讨论并发代码性能时被引用**，由该定律可知，**并发程序的性能绝对不会超过1/Fs**。
+
+所以**减少“串行”部分的大小，或者减少线程等待的时间，就能更好的改善程序的性能**。如果我们在线程等待的时候做一些有用的事情，就能将这个等待“隐藏”掉。
+
+阻塞的线程相当于什么都没做，但这浪费了CPU时间。**如果你知道一个线程可能花费相当长的时间等待，那么你可以通过运行一个或多个线程来利用和这个时间**。
+
+例如，如果一个线程正在等待一个I/O操作完成，那么你可以使用异步I/O来进行这个操作，这样线程就可以执行其它有用的工作，同时后台运行着I/O操作；如果一个线程正在等待另一个线程完成一个操作，那么你可以尝试自己完成那个操作；如果一个线程正在等待一个任务被完成，但是这个任务还没有被启动，那么你可以尝试在本线程完成这个任务或者做其它没有开始的任务，就像[这里](#data_based_work_division)的`do_sort`一样。
+
+**有时候添加线程并不是为了利用所有可用的处理器，而是为了对外部事件进行及时的响应**。
+
+<h3 id="improving_responsiveness_with_concurrency">多线程改善响应能力</h3>
+
+大多数图形化用户接口框架都是事件驱动型(event driven)，其主循环很可能与下面类似：
+
+```c++
+while (true)
+{
+	event_data event = get_event();
+	if (event.type == quit)
+		break;
+	process(event);
+}
+```
+
+为了确保及时响应用户输入，`get_event`和`process`必须以合理的频率被调用，不管程序在做什么。在[基于任务类型的工作划分](#task_type_based_work_division)第一节中，我们了解了单一线程及时处理用户输入是会大大增加代码的复杂性的，通过分离关注点，我们可以将处理用户输入与任务执行放在不同的线程中，下面的示例没有考虑线程数过载，且只具有参考价值：
+
+```c++
+std::thread task_thread;
+std::atomic<bool> task_cancelled(false);
+void gui_thread()
+{
+	while (true)
+	{
+		event_data event = get_event();
+		if (event.type == quit)
+			break;
+		process(event);
+	}
+}
+
+void task()
+{
+	while (!task_complete() && !task_cancelled)
+	{
+		do_next_operation();
+	}
+	if (task_cancelled)
+	{
+		perform_cleanup();
+	}
+	else
+	{
+		post_gui_event(task_complete);
+	}
+}
+
+void process(event_data const& event)
+{
+	switch (event.type)
+	{
+	case start_task:
+		task_cancelled = false;
+		task_thread = std::thread(task);
+		break;
+	case stop_task:
+		task_cancelled = true;
+		task_thread.join();
+		break;
+	case task_complete:
+		task_thread.join();
+		display_results();
+		break;
+	default:
+		//...
+	}
+}
+```
+
+<h2 id="designing_concurrent_code_in_practice">多线程代码设计实战</h2>
+
