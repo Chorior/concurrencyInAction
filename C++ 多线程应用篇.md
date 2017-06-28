@@ -19,7 +19,9 @@ tags:
 	*	[为多线程性能设计数据结构](#designing_data_structures_for_multithreaded_performance)
 	*	[多线程设计时的其它注意事项](#additional_considerations_when_designing_for_concurrency)
 	*	[多线程改善响应能力](#improving_responsiveness_with_concurrency)
-	*	[多线程代码设计实战](#designing_concurrent_code_in_practice)
+	*	[std::for_each](#std_for_each)
+	*	[std::find](#std_find)
+	*	[std::partial_sum](#std_partial_sum)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -1062,5 +1064,414 @@ void process(event_data const& event)
 }
 ```
 
-<h2 id="designing_concurrent_code_in_practice">多线程代码设计实战</h2>
+<h3 id="std_for_each">std::for_each</h3>
 
+`std::for_each`对范围内每个元素调用同一个函数，其并行版与序列版唯一的区别就是元素调用函数的顺序。要实现一个`std::for_each`的并行版本，只需要基于数据的工作划分，即每个线程做一定数量的元素的工作。
+
+*	假设系统只有这一个多线程程序在运行，所以你可以使用`std::thread::hardware_concurrency()`来决定线程的数量；
+*	你知道元素的数量在工作开始前就能得到，所以你可以在工作开始前就将数据划分好；
+*	你也知道每个线程肯定是相互独立的，所以你可以使用连续的数据块来避免伪共享(false sharing)。
+
+一个简单的实现如下，为了体现元素操作的顺序，借用[threadsafe_list](https://chorior.github.io/2017/05/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E8%AE%BE%E8%AE%A1-%E4%B8%80/#linked_list)来保存操作的顺序：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+#include "myLinkedList.h"
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+template<typename Iterator, typename Func>
+void parallel_for_each(Iterator first, Iterator last, Func f)
+{
+	unsigned long const length = std::distance(first, last);
+	if (!length)
+		return;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+	unsigned long const block_size = length / num_threads;
+
+	std::vector<std::future<void> > futures(num_threads - 1);
+	std::vector<std::thread> threads(num_threads - 1);
+	join_threads joiner(threads);
+
+	Iterator block_start = first;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		Iterator block_end = block_start;
+		std::advance(block_end, block_size);
+		std::packaged_task<void(void)> task(
+			[=]()
+		{
+			std::for_each(block_start, block_end, f);
+		});
+		futures[i] = task.get_future();
+		threads[i] = std::thread(std::move(task)); // task是一个可调用对象
+		block_start = block_end;
+	}
+	std::for_each(block_start, last, f);
+
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		futures[i].get();
+	}
+}
+
+int main()
+{
+	std::vector<int> nums;
+	for (int i = 0; i < 51; ++i) {
+		nums.push_back(i);
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+
+	threadsafe_list<int> order;
+	auto func = [&order](int &i)
+	{ 
+		order.push_front(i);
+	};
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	std::for_each(begin, end, func);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "for_each tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	order.for_each([](int i) {std::cout << i << std::ends; });
+	std::cout << "\n";
+	order.remove_if([](int const&) {return true; });
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		parallel_for_each<decltype(begin), decltype(func)>(begin, end, func);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_for_each tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	order.for_each([](int i) {std::cout << i << std::ends; });
+}
+```
+
+结果如下：
+
+```text
+for_each tooks 0.228043 ms
+50 49 48 47 46 45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0
+parallel_for_each tooks 0.829425 ms
+50 33 49 32 48 31 47 30 46 29 45 28 44 27 43 26 42 25 41 24 40 23 39 22 38 21 37 20 36 19 35 18 34 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0
+```
+
+再用`std::async`来实现一下：
+
+```c++
+template<typename Iterator, typename Func>
+void parallel_for_each(Iterator first, Iterator last, Func f)
+{
+	unsigned long const length = std::distance(first, last);
+	if (!length)
+		return;
+
+	unsigned long const min_per_thread = 25;
+	if (length<(2 * min_per_thread))
+	{
+		std::for_each(first, last, f);
+	}
+	else
+	{
+		Iterator const mid_point = first + length / 2;
+		std::future<void> first_half =
+			std::async(&parallel_for_each<Iterator, Func>,
+				first, mid_point, f);
+		parallel_for_each(mid_point, last, f);
+		first_half.get();
+	}
+}
+```
+
+结果如下：
+
+```text
+for_each tooks 0.307587 ms
+50 49 48 47 46 45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0
+parallel_for_each tooks 0.643719 ms
+24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 50 2 49 1 48 0 47 46 45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25
+```
+
+<h3 id="std_find">std::find</h3>
+
+`std::find`并不一定对所有元素都做一次操作，所以如果已经找到目标，就应该中断其它线程。一种中断其它线程的方法是设置一个原子flag变量，然后在每次操作完成之后对其进行检查。为了返回值，以及传递可能发生的异常，你可以使用`std::packaged_task`或`std::promise`，两者的区别就是：`std::packaged_task`可以存储所有发生的异常，如果有一个线程发生了异常，其它线程还能继续执行，但是`std::promise`只能存储一个异常，只要有一个线程发生了异常，就会中断所有执行。
+
+虽然`std::packaged_task`可以存储所有发生的异常，但实际上只能有一个异常能被抛出，所以我们选择`std::promise`来实现`std::find`的并行算法。这里一个比较重要的点是：如果找不到目标，那么`future.get()`将永远阻塞下去，所以在调用`get()`之前，需要等待所有线程结束，并对flag进行检查。
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+template<typename Iterator, typename MatchType>
+Iterator parallel_find(Iterator first, Iterator last, MatchType match)
+{
+	struct find_element
+	{
+		void operator()(Iterator begin, Iterator end,
+			MatchType match,
+			std::promise<Iterator>* result,
+			std::atomic<bool>* done_flag)
+		{
+			try
+			{
+				for (; (begin != end) && !done_flag->load(); ++begin)
+				{
+					if (*begin == match)
+					{
+						// 如果有多个匹配的值，那么这里会发生竞争，
+						// 但是没关系，不管哪个值被设置，都是正确的值
+						// 同理，下面的异常设置
+						result->set_value(begin);
+						done_flag->store(true);
+						return;
+					}
+				}
+			}
+			catch (...)
+			{
+				try
+				{
+					result->set_exception(std::current_exception());
+					done_flag->store(true);
+				}
+				catch (...)
+				{
+				}
+			}
+		}
+	};
+
+	unsigned long const length = std::distance(first, last);
+	if (!length)
+		return last;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+	unsigned long const block_size = length / num_threads;
+
+	std::promise<Iterator> result;
+	std::atomic<bool> done_flag(false);
+	std::vector<std::thread> threads(num_threads - 1);
+
+	// 代码块的作用是控制join_threads的生命周期
+	{
+		join_threads joiner(threads);
+		Iterator block_start = first;
+		for (unsigned long i = 0; i<(num_threads - 1); ++i)
+		{
+			Iterator block_end = block_start;
+			std::advance(block_end, block_size);
+			threads[i] = std::thread(find_element(),
+				block_start, block_end, match,
+				&result, &done_flag);
+			block_start = block_end;
+		}
+		find_element()(block_start, last, match, &result, &done_flag);
+	}
+
+	if (!done_flag.load())
+	{
+		return last;
+	}
+	return result.get_future().get();
+}
+
+int main()
+{
+	std::vector<int> nums;
+	for (int i = 0; i < 1000; ++i) {
+		nums.push_back(i);
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+	int goal = 501;
+
+	decltype(begin) result1 = end;
+	decltype(begin) result2 = end;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	result1 = std::find(begin, end, goal);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "for_each tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		result2 = parallel_find<decltype(begin), decltype(goal)>(begin, end, goal);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_for_each tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	if (end != result1) { std::cout << *result1 << std::endl; }
+	if (end != result2) { std::cout << *result2 << std::endl; }
+}
+```
+
+结果：
+
+```text
+for_each tooks 0.014433 ms
+parallel_for_each tooks 0.88844 ms
+501
+501
+
+```
+
+再用`std::async`实现：
+
+```c++
+template<typename Iterator, typename MatchType>
+Iterator parallel_find_impl(Iterator first, Iterator last, MatchType match,
+	std::atomic<bool>& done)
+{
+	try
+	{
+		unsigned long const length = std::distance(first, last);
+		unsigned long const min_per_thread = 25;
+		if (length<(2 * min_per_thread))
+		{
+			for (; (first != last) && !done.load(); ++first)
+			{
+				if (*first == match)
+				{
+					done = true;
+					return first;
+				}
+			}
+			return last;
+		}
+		else
+		{
+			Iterator const mid_point = first + (length / 2);
+			std::future<Iterator> async_result =
+				std::async(&parallel_find_impl<Iterator, MatchType>,
+					mid_point, last, match, std::ref(done));
+			Iterator const direct_result =
+				parallel_find_impl(first, mid_point, match, done);
+			return (direct_result == mid_point) ?
+				async_result.get() : direct_result;
+		}
+	}
+	catch (...)
+	{
+		done = true;
+		throw;
+	}
+}
+
+template<typename Iterator, typename MatchType>
+Iterator parallel_find(Iterator first, Iterator last, MatchType match)
+{
+	std::atomic<bool> done(false);
+	// 为了递归调用且有一个全局flag，所以需要另起一个函数
+	return parallel_find_impl(first, last, match, done);
+}
+```
+
+结果：
+
+```text
+for_each tooks 0.03047 ms
+parallel_for_each tooks 3.08998 ms
+501
+501
+
+```
+
+<h3 id="std_partial_sum">std::partial_sum</h3>
+
+```c++
+template<class _InIt,
+	class _OutIt,
+	class _Fn2> inline
+	_OutIt partial_sum(_InIt _First, _InIt _Last,
+		_OutIt _Dest, _Fn2 _Func)
+	{	// compute partial sums into _Dest, using _Func
+	_DEPRECATE_UNCHECKED(partial_sum, _Dest);
+	return (_Partial_sum_no_deprecate(_First, _Last, _Dest, _Func));
+	}
+```
+
+查看`partial_sum`的[官方说明文档](http://en.cppreference.com/w/cpp/algorithm/partial_sum)，其功能简要的概括一下就是：对范围内的每个元素进行叠加，但是每加一个元素，就保存一个值，保存的开始位置在第三个参数中给出，第四个参数可以指定其他的二元算法。
+
+要想实现该算法的并行版本，由于各个线程的数据不是相互独立的，例如第一个元素在每个线程都被使用了，所以就不能像上面的`for_each`和`find`一样进行简单的划分了。
