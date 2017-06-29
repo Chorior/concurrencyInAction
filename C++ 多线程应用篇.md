@@ -1474,4 +1474,375 @@ template<class _InIt,
 
 查看`partial_sum`的[官方说明文档](http://en.cppreference.com/w/cpp/algorithm/partial_sum)，其功能简要的概括一下就是：对范围内的每个元素进行叠加，但是每加一个元素，就保存一个值，保存的开始位置在第三个参数中给出，第四个参数可以指定其他的二元算法。
 
-要想实现该算法的并行版本，由于各个线程的数据不是相互独立的，例如第一个元素在每个线程都被使用了，所以就不能像上面的`for_each`和`find`一样进行简单的划分了。
+要想实现该算法的并行版本，由于各个线程的数据不是相互独立的，例如第一个元素在每个线程都被使用了，所以就不能像上面的`for_each`和`find`一样进行简单的划分了。假设你有一组数据{1,2,3,4,5,6,7,8,9}，你将其分为三个小块，{1,2,3}、{4,5,6}、{7,8,9}，对这三个小块分别进行`partial_sum`，结果将是{1,3,6}、{4,9,15}、{7,15,24}，合并结果为{1,3,6,4,9,15,7,15,24}，很明显正确结果应该是{1,3,6,10,15,21,28,36,45}，怎样才能获得正确结果呢？如果能将第一小块的最后一个结果添加到第二个小块的所有结果上，再将第二个小块的最后一个结果添加到第三个小块的左右结果上，结果就正确了。
+
+如果每个小块都先更新最后一个结果，那么计算每个小块剩余元素的线程就可以与下一个小块线程同时运行了。但是如果你的总元素个数太少或者处理器数量太多的话，后面的处理器肯定需要等待前面的处理器返回结果才能开始运行，这是不好的。换一种传递方式，你首先将相邻元素求和，结果为{1,3,5,7,9,11,13,15,17}，这个结果对于两个元素是完全正确的；然后将这些结果两个两个相加，结果为{1,3,6,10,14,15,22,26,30}，这个结果对于前四个元素也是完全正确的；在将结果四个四个相加，结果为{1,3,6,10,15,18,28,36,44}，该结果对于前八个元素是完全正确的；接着是{1,3,6,10,15,18,28,36,45}，该结果就是最终结果。
+
+如果一共有N个元素、k个线程，那么使用第一种方法，每个线程需要做一次计算最后一个结果的操作，次数为N/k，然后再做一次值的传递操作，次数也是N/k；使用第二种方法需要做log2(N)次N个操作，所以第一种方法的复杂度是O(N)，第二种方法的复杂度是Nlog2(N)，然而如果你有N个处理器，那么第二种方法会使得每个处理器只有log2(N)个操作，而第一种方法在K变得足够大时，会序列化绝大多数操作。
+
+下面实现了第一种算法：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+template<typename Iterator>
+void parallel_partial_sum(Iterator first, Iterator last)
+{
+	typedef typename Iterator::value_type value_type;
+	struct process_chunk
+	{
+		void operator()(Iterator begin, Iterator last,
+			std::future<value_type>* previous_end_value,
+			std::promise<value_type>* end_value)
+		{
+			try
+			{
+				Iterator end = last;
+				++end;
+				std::partial_sum(begin, end, begin);
+				if (previous_end_value)
+				{
+					value_type addend = previous_end_value->get();
+					*last += addend;
+					if (end_value)
+					{
+						end_value->set_value(*last);
+					}
+					std::for_each(begin, last, [addend](value_type& item)
+					{
+						item += addend;
+					});
+				}
+				else if (end_value)
+				{
+					end_value->set_value(*last);
+				}
+			}
+			catch (...)
+			{
+				if (end_value)
+				{
+					end_value->set_exception(std::current_exception());
+				}
+				else
+				{
+					throw;
+				}
+			}
+		}
+	};
+
+	unsigned long const length = std::distance(first, last);
+	if (!length)
+		return ;
+
+	unsigned long const min_per_thread = 25;
+	unsigned long const max_threads =
+		(length + min_per_thread - 1) / min_per_thread;
+	unsigned long const hardware_threads =
+		std::thread::hardware_concurrency();
+	unsigned long const num_threads =
+		std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads);
+	unsigned long const block_size = length / num_threads;
+
+	std::vector<std::thread> threads(num_threads - 1);
+	std::vector<std::promise<value_type> > end_values(num_threads - 1);
+	std::vector<std::future<value_type> > previous_end_values;
+
+	// 分配至少能容纳num_threads - 1个元素的内存空间
+	// 可以避免在push_back时重新分配内存，因为你知道需要多大的空间
+	previous_end_values.reserve(num_threads - 1);
+
+	join_threads joiner(threads);
+	Iterator block_start = first;
+	for (unsigned long i = 0; i<(num_threads - 1); ++i)
+	{
+		Iterator block_last = block_start;
+		std::advance(block_last, block_size - 1);
+		threads[i] = std::thread(process_chunk(),
+			block_start, block_last,
+			(i != 0) ? &previous_end_values[i - 1] : 0,
+			&end_values[i]);
+		block_start = block_last;
+		++block_start;
+		previous_end_values.push_back(end_values[i].get_future());
+	}
+	Iterator final_element = block_start;
+	std::advance(final_element, std::distance(block_start, last) - 1);
+	process_chunk()(block_start, final_element,
+		(num_threads>1) ? &previous_end_values.back() : 0,
+		0);
+}
+
+int main()
+{
+	std::vector<int> nums;
+	for (int i = 0; i < 51; ++i) {
+		nums.push_back(i);
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+	std::vector<int> result(nums.size());
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	std::partial_sum(begin, end, result.begin());
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "partial_sum tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		parallel_partial_sum<decltype(begin)>(begin, end);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what() << "\n";
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_partial_sum tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	for (auto &i : result)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << "\n";
+	for (auto &i : nums)
+	{
+		std::cout << i << " ";
+	}
+}
+```
+
+结果：
+
+```text
+partial_sum tooks 0.027584 ms
+parallel_partial_sum tooks 0.886516 ms
+0 1 3 6 10 15 21 28 36 45 55 66 78 91 105 120 136 153 171 190 210 231 253 276 300 325 351 378 406 
+435 465 496 528 561 595 630 666 703 741 780 820 861 903 946 990 1035 1081 1128 1176 1225 1275
+0 1 3 6 10 15 21 28 36 45 55 66 78 91 105 120 136 153 171 190 210 231 253 276 300 325 351 378 406 
+435 465 496 528 561 595 630 666 703 741 780 820 861 903 946 990 1035 1081 1128 1176 1225 1275
+```
+
+在对`previous_end_values`进行操作的时候，使用`push_back`而非以往的赋值操作，是为了让代码更加清晰，更容易理解，当然你也可以写成下面这样：
+
+```c++
+...
+std::vector<std::future<value_type> > previous_end_values(num_threads - 1);
+// previous_end_values.reserve(num_threads - 1);
+...
+for (unsigned long i = 0; i<(num_threads - 1); ++i)
+{
+	...
+	previous_end_values[i] = end_values[i].get_future();
+}
+```
+
+在做最后一块时，也可以简化为：
+
+```c++
+process_chunk()(block_start, last - 1,
+		(num_threads>1) ? &previous_end_values.back() : 0,
+		0);
+```
+
+第二种方法的实现：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+class barrier
+{
+	std::atomic<unsigned> count;
+	std::atomic<unsigned> spaces;
+	std::atomic<unsigned> generation;
+
+public:
+	explicit barrier(unsigned count_) :
+		count(count_), spaces(count_), generation(0)
+	{}
+
+	void wait()
+	{
+		unsigned const my_generation = generation;
+		if (!--spaces)
+		{
+			spaces = count.load();
+			++generation;
+		}
+		else
+		{
+			while (generation == my_generation)
+				std::this_thread::yield();
+		}
+	}
+
+	void done_waiting()
+	{
+		--count;
+		if (!--spaces)
+		{
+			spaces = count.load();
+			++generation;
+		}
+	}
+};
+
+template<typename Iterator>
+void parallel_partial_sum(Iterator first, Iterator last)
+{
+	typedef typename Iterator::value_type value_type;
+	struct process_element
+	{
+		void operator()(Iterator first, Iterator last,
+			std::vector<value_type>& buffer,
+			unsigned i, barrier& b)
+		{
+			value_type& ith_element = *(first + i);
+			bool update_source = false;
+			for (unsigned step = 0, stride = 1; stride <= i; ++step, stride *= 2)
+			{
+				value_type const& source = (step % 2) ?
+					buffer[i] : ith_element;
+				value_type& dest = (step % 2) ?
+					ith_element : buffer[i];
+				value_type const& addend = (step % 2) ?
+					buffer[i - stride] : *(first + i - stride);
+				dest = source + addend;
+				update_source = !(step % 2);
+				b.wait();
+			}
+			if (update_source)
+			{
+				ith_element = buffer[i];
+			}
+			b.done_waiting();
+		}
+	};
+
+	unsigned long const length = std::distance(first, last);
+	if (length <= 1)
+		return;
+
+	std::vector<value_type> buffer(length);
+	barrier b(length);
+	std::vector<std::thread> threads(length - 1);
+	join_threads joiner(threads);
+	Iterator block_start = first;
+	for (unsigned long i = 0; i<(length - 1); ++i)
+	{
+		threads[i] = std::thread(process_element(), first, last,
+			std::ref(buffer), i, std::ref(b));
+	}
+	process_element()(first, last, buffer, length - 1, b);
+}
+
+int main()
+{
+	std::vector<int> nums;
+	for (int i = 0; i < 51; ++i) {
+		nums.push_back(i);
+	}
+
+	auto begin = nums.begin();
+	auto end = nums.end();
+	std::vector<int> result(nums.size());
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	std::partial_sum(begin, end, result.begin());
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "partial_sum tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		parallel_partial_sum<decltype(begin)>(begin, end);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what() << "\n";
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_partial_sum tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	for (auto &i : result)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << "\n";
+	for (auto &i : nums)
+	{
+		std::cout << i << " ";
+	}
+}
+```
+
+结果：
+
+```text
+partial_sum tooks 0.041375 ms
+parallel_partial_sum tooks 13.122 ms
+0 1 3 6 10 15 21 28 36 45 55 66 78 91 105 120 136 153 171 190 210 231 253 276 300 325 351 378 406 
+435 465 496 528 561 595 630 666 703 741 780 820 861 903 946 990 1035 1081 1128 1176 1225 1275
+0 1 3 6 10 15 21 28 36 45 55 65 78 91 105 120 136 153 171 190 210 231 253 276 300 325 351 377 406 
+435 465 496 528 561 595 629 666 703 741 780 820 860 900 940 980 1020 1060 1100 1176 1225 1275
+```
