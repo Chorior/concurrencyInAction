@@ -24,6 +24,7 @@ tags:
 	*	[std::partial_sum](#std_partial_sum)
 *	[高级线程管理](#advanced_thread_management)
 	*	[线程池(thread pool)](#thread_pool)
+	*	[线程中断](#interrupting_threads)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -2519,4 +2520,927 @@ futures[i] = pool.submit([block_start, block_end]()
 ```
 
 #### 等待其它任务的任务
+
+在[基于数据的工作划分](#data_based_work_division)中，我们实现了quick-sort的一种并行版本。该版本使用一个stack来保存划分的数据块，每个线程不断划分它要排序的数据，然后将较小的数据块添加到stack，并在当前线程排序较大的数据块。这样在结果合并时就会等待较小数据块排序完成，继而耗费一个线程处于等待状态，但是线程数是有限的，一种极端情况下所有线程都处于等待状态。
+
+至今为止的两个线程池都有上面的问题，线程数有限、但是所有线程都在等待任务，从而导致没有一个空闲的线程。解决这个问题的方法是：**在等待时，可以处理其它未完成的任务**。线程池也可以使用这种解决方案，但是需要将`work_thread`循环中的处理操作单独放在一个函数中，这样如果有线程在等待，那么就可以调用这个函数处理未完成的任务了。
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+#include <list>
+
+#include "myQueue.h"
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+class function_wrapper
+{
+	struct impl_base {
+		virtual void call() = 0;
+		virtual ~impl_base() {}
+	};
+
+	template<typename F>
+	struct impl_type : impl_base
+	{
+		F f;
+		impl_type(F&& f_) : f(std::move(f_)) {}
+		void call() { f(); }
+	};
+
+	std::unique_ptr<impl_base> impl;
+
+public:
+	function_wrapper() = default;
+
+	template<typename F>
+	function_wrapper(F&& f) :
+		impl(new impl_type<F>(std::move(f)))
+	{}
+
+	function_wrapper(const function_wrapper&) = delete;
+	function_wrapper& operator=(const function_wrapper&) = delete;
+
+	function_wrapper(function_wrapper&& other) :
+		impl(std::move(other.impl))
+	{}
+
+	function_wrapper& operator=(function_wrapper&& other)
+	{
+		impl = std::move(other.impl);
+		return *this;
+	}
+
+	void operator()() { impl->call(); }
+};
+
+class thread_pool
+{
+	std::atomic_bool done;
+	threadsafe_queue<function_wrapper> work_queue;
+	std::vector<std::thread> threads;
+	join_threads joiner;
+
+	void worker_thread()
+	{
+		while (!done)
+		{
+			run_pending_task();
+		}
+	}
+
+public:
+	thread_pool() :
+		done(false), joiner(threads)
+	{
+		unsigned const thread_count = std::thread::hardware_concurrency();
+		try
+		{
+			for (unsigned i = 0; i<thread_count; ++i)
+			{
+				threads.push_back(
+					std::thread(&thread_pool::worker_thread, this));
+			}
+		}
+		catch (...)
+		{
+			done = true;
+			throw;
+		}
+	}
+
+	~thread_pool()
+	{
+		done = true;
+	}
+
+	// std::result_of: 在编译的时候推导出一个函数调用表达式的返回值类型
+	template<typename FunctionType>
+	std::future<typename std::result_of<FunctionType()>::type>
+		submit(FunctionType f)
+	{
+		typedef typename std::result_of<FunctionType()>::type
+			result_type;
+		std::packaged_task<result_type()> task(std::move(f));
+		std::future<result_type> res(task.get_future());
+		work_queue.push(std::move(task));
+		return res;
+	}
+
+	void run_pending_task()
+	{
+		function_wrapper task;
+		if (work_queue.try_pop(task))
+		{
+			task();
+		}
+		else
+		{
+			std::this_thread::yield();
+		}
+	}
+};
+
+template<typename T>
+struct sorter
+{
+	thread_pool pool;
+	std::list<T> do_sort(std::list<T>& chunk_data)
+	{
+		if (chunk_data.empty())
+		{
+			return chunk_data;
+		}
+
+		std::list<T> result;
+		result.splice(result.begin(), chunk_data, chunk_data.begin());
+		T const& partition_val = *result.begin();
+
+		typename std::list<T>::iterator divide_point =
+			std::partition(chunk_data.begin(), chunk_data.end(),
+				[&](T const& val) {return val<partition_val; });
+
+		std::list<T> new_lower_chunk;
+		new_lower_chunk.splice(new_lower_chunk.end(),
+			chunk_data, chunk_data.begin(),
+			divide_point);
+		std::future<std::list<T> > new_lower =
+			pool.submit(std::bind(&sorter::do_sort, this,
+				std::move(new_lower_chunk)));
+
+		std::list<T> new_higher(do_sort(chunk_data));
+		result.splice(result.end(), new_higher);
+		while (new_lower.wait_for(std::chrono::seconds(0)) !=
+			std::future_status::ready)
+		{
+			pool.run_pending_task();
+		}
+
+		result.splice(result.begin(), new_lower.get());
+		return result;
+	}
+};
+
+template<typename T>
+std::list<T> parallel_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	sorter<T> s;
+	return s.do_sort(input);
+}
+
+template<typename T>
+std::list<T> sequential_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	std::list<T> result;
+	// l.splice(iterator pos,list& x, iterator i)
+	// 将x中i指向的元素移动插入到l中pos指向的位置之前
+	result.splice(result.begin(), input, input.begin());
+	T const& pivot = *result.begin();
+
+	// std::partition(iterator beg, iterator end, func)
+	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
+	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
+	auto divide_point = std::partition(input.begin(), input.end(),
+		[&](T const& t) {return t<pivot; });
+
+	std::list<T> lower_part;
+	// l.splice(iterator pos,list& x, iterator beg, iterator end)
+	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
+	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
+
+	auto new_lower(
+		sequential_quick_sort(std::move(lower_part)));
+	auto new_higher(
+		sequential_quick_sort(std::move(input)));
+
+	// l.splice(iterator pos,list& x)
+	// 将x中所有元素移动插入到l中pos指向的位置之前
+	result.splice(result.end(), new_higher);
+	result.splice(result.begin(), new_lower);
+	return result;
+}
+
+int main()
+{
+	// 随机数生成
+	std::list<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 1000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	std::list<int> result1, result2;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	result1 = sequential_quick_sort<int>(nums);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "sequential_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		result2 = parallel_quick_sort<int>(nums);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	/*for (auto &i : result1)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << "\n";
+	for (auto &i : result2)
+	{
+		std::cout << i << " ";
+	}*/
+}
+```
+
+结果：
+
+```text
+sequential_quick_sort tooks 72.3024 ms
+parallel_quick_sort tooks 61.8166 ms
+
+```
+
+这比[基于数据的工作划分](#data_based_work_division)中的代码简单多了，但是**由于`submit`或`run_pending_task`的每次调用都会去修改同一个`work_queue`，这就会造成强烈的数据竞争，虽然这个queue是线程安全的，但是还是会对性能造成很大的影响**。
+
+#### 避免`work_queue`的竞争
+
+要想避免`work_queue`的竞争，可以为每个线程设立一个独立的queue，这就需要`thread_local`声明了，该修饰符修饰的变量具有线程生命周期，完整示例如下：
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+#include <list>
+#include <memory>
+#include <queue>
+
+#include "myQueue.h"
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+class function_wrapper
+{
+	struct impl_base {
+		virtual void call() = 0;
+		virtual ~impl_base() {}
+	};
+
+	template<typename F>
+	struct impl_type : impl_base
+	{
+		F f;
+		impl_type(F&& f_) : f(std::move(f_)) {}
+		void call() { f(); }
+	};
+
+	std::unique_ptr<impl_base> impl;
+
+public:
+	function_wrapper() = default;
+
+	template<typename F>
+	function_wrapper(F&& f) :
+		impl(new impl_type<F>(std::move(f)))
+	{}
+
+	function_wrapper(const function_wrapper&) = delete;
+	function_wrapper& operator=(const function_wrapper&) = delete;
+
+	function_wrapper(function_wrapper&& other) :
+		impl(std::move(other.impl))
+	{}
+
+	function_wrapper& operator=(function_wrapper&& other)
+	{
+		impl = std::move(other.impl);
+		return *this;
+	}
+
+	void operator()() { impl->call(); }
+};
+
+class thread_pool
+{
+	std::atomic_bool done;
+	std::vector<std::thread> threads;
+	threadsafe_queue<function_wrapper> pool_work_queue;
+	join_threads joiner;
+
+	void worker_thread()
+	{
+		local_work_queue.reset(new local_queue_type);
+		while (!done)
+		{
+			run_pending_task();
+		}
+	}
+
+public:
+	typedef std::queue<function_wrapper> local_queue_type;
+	static thread_local std::unique_ptr<local_queue_type>
+		local_work_queue; // 静态非常量成员必须在类外进行初始化
+
+	thread_pool() :
+		done(false), joiner(threads)
+	{
+		unsigned const thread_count = std::thread::hardware_concurrency();
+		try
+		{
+			for (unsigned i = 0; i<thread_count; ++i)
+			{
+				threads.push_back(
+					std::thread(&thread_pool::worker_thread, this));
+			}
+		}
+		catch (...)
+		{
+			done = true;
+			throw;
+		}
+	}
+
+	~thread_pool()
+	{
+		done = true;
+	}
+
+	template<typename FunctionType>
+	std::future<typename std::result_of<FunctionType()>::type>
+		submit(FunctionType f)
+	{
+		typedef typename std::result_of<FunctionType()>::type result_type;
+		std::packaged_task<result_type()> task(f);
+		std::future<result_type> res(task.get_future());
+		if (local_work_queue)
+		{
+			local_work_queue->push(std::move(task));
+		}
+		else
+		{
+			pool_work_queue.push(std::move(task));
+		}
+		return res;
+	}
+
+	void run_pending_task()
+	{
+		function_wrapper task;
+		if (local_work_queue && !local_work_queue->empty())
+		{
+			task = std::move(local_work_queue->front());
+			local_work_queue->pop();
+			task();
+		}
+		else if (pool_work_queue.try_pop(task))
+		{
+			task();
+		}
+		else
+		{
+			std::this_thread::yield();
+		}
+	}
+};
+
+thread_local std::unique_ptr<thread_pool::local_queue_type> thread_pool::local_work_queue = nullptr;
+
+template<typename T>
+struct sorter
+{
+	thread_pool pool;
+	std::list<T> do_sort(std::list<T>& chunk_data)
+	{
+		if (chunk_data.empty())
+		{
+			return chunk_data;
+		}
+
+		std::list<T> result;
+		result.splice(result.begin(), chunk_data, chunk_data.begin());
+		T const& partition_val = *result.begin();
+
+		typename std::list<T>::iterator divide_point =
+			std::partition(chunk_data.begin(), chunk_data.end(),
+				[&](T const& val) {return val<partition_val; });
+
+		std::list<T> new_lower_chunk;
+		new_lower_chunk.splice(new_lower_chunk.end(),
+			chunk_data, chunk_data.begin(),
+			divide_point);
+		std::future<std::list<T> > new_lower =
+			pool.submit(std::bind(&sorter::do_sort, this,
+				std::move(new_lower_chunk)));
+
+		std::list<T> new_higher(do_sort(chunk_data));
+		result.splice(result.end(), new_higher);
+		while (new_lower.wait_for(std::chrono::seconds(0)) !=
+			std::future_status::ready)
+		{
+			pool.run_pending_task();
+		}
+
+		result.splice(result.begin(), new_lower.get());
+		return result;
+	}
+};
+
+template<typename T>
+std::list<T> parallel_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	sorter<T> s;
+	return s.do_sort(input);
+}
+
+template<typename T>
+std::list<T> sequential_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	std::list<T> result;
+	// l.splice(iterator pos,list& x, iterator i)
+	// 将x中i指向的元素移动插入到l中pos指向的位置之前
+	result.splice(result.begin(), input, input.begin());
+	T const& pivot = *result.begin();
+
+	// std::partition(iterator beg, iterator end, func)
+	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
+	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
+	auto divide_point = std::partition(input.begin(), input.end(),
+		[&](T const& t) {return t<pivot; });
+
+	std::list<T> lower_part;
+	// l.splice(iterator pos,list& x, iterator beg, iterator end)
+	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
+	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
+
+	auto new_lower(
+		sequential_quick_sort(std::move(lower_part)));
+	auto new_higher(
+		sequential_quick_sort(std::move(input)));
+
+	// l.splice(iterator pos,list& x)
+	// 将x中所有元素移动插入到l中pos指向的位置之前
+	result.splice(result.end(), new_higher);
+	result.splice(result.begin(), new_lower);
+	return result;
+}
+
+int main()
+{
+	// 随机数生成
+	std::list<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 100; ++i) {
+		nums.push_back(u(e));
+	}
+
+	std::list<int> result1, result2;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	result1 = sequential_quick_sort<int>(nums);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "sequential_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		result2 = parallel_quick_sort<int>(nums);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	/*for (auto &i : result1)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << "\n";
+	for (auto &i : result2)
+	{
+		std::cout << i << " ";
+	}*/
+}
+```
+
+结果：
+
+```text
+sequential_quick_sort tooks 9.58035 ms
+parallel_quick_sort tooks 13.7223 ms
+
+```
+
+该实现确实避免了对`work_queue`的竞争，但是如果分贝不均的话，一些线程可能有大量的任务，而另一些线程却无所事事。解决这个问题的方法就是：**当本线程和全局queue没有任务可做时，允许获取其它线程的任务**。
+
+#### 线程间获取任务
+
+要想使得线程间可以相互获取任务，那么线程所持有的queue一定要能在`run_pending_task`被访问，同时你也必须保证这个queue被正确的同步与保护着。为此，我们可以直接使用已创建的`threadsafe_queue`，然后将所有线程的queue保存在一个全局容器里，`run_pending_task`在获取任务时，先检查本地queue，再检查全局queue，最后逐个检查其他线程的queue。这里在检查其它线程queue时，一个比较重要点是：不要从线程0到最后一个线程逐个检查，这样每个空闲的线程都会尝试从线程0的queue获取任务，可能会造成对线程0的queue的竞争访问。解决方案是：从空闲线程的下一个线程的queue开始获取，直到对所有线程的queue都做一个遍历。**因为要做遍历，所以在检查其它线程的queue之前，先要判断是否所有线程都开起来了**。
+
+```c++
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <thread>
+#include <future>
+#include <random>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+#include <list>
+#include <memory>
+#include <queue>
+
+#include "myQueue.h"
+
+class join_threads
+{
+	std::vector<std::thread>& threads;
+
+public:
+	explicit join_threads(std::vector<std::thread>& threads_) :
+		threads(threads_)
+	{}
+
+	~join_threads()
+	{
+		for (unsigned long i = 0; i<threads.size(); ++i)
+		{
+			if (threads[i].joinable())
+				threads[i].join();
+		}
+	}
+};
+
+class function_wrapper
+{
+	struct impl_base {
+		virtual void call() = 0;
+		virtual ~impl_base() {}
+	};
+
+	template<typename F>
+	struct impl_type : impl_base
+	{
+		F f;
+		impl_type(F&& f_) : f(std::move(f_)) {}
+		void call() { f(); }
+	};
+
+	std::unique_ptr<impl_base> impl;
+
+public:
+	function_wrapper() = default;
+
+	template<typename F>
+	function_wrapper(F&& f) :
+		impl(new impl_type<F>(std::move(f)))
+	{}
+
+	function_wrapper(const function_wrapper&) = delete;
+	function_wrapper& operator=(const function_wrapper&) = delete;
+
+	function_wrapper(function_wrapper&& other) :
+		impl(std::move(other.impl))
+	{}
+
+	function_wrapper& operator=(function_wrapper&& other)
+	{
+		impl = std::move(other.impl);
+		return *this;
+	}
+
+	void operator()() { impl->call(); }
+};
+
+class thread_pool
+{
+	typedef function_wrapper task_type;
+	std::atomic_bool done;
+	threadsafe_queue<task_type> pool_work_queue;
+	std::vector<std::unique_ptr<threadsafe_queue<function_wrapper> > > queues;
+	std::vector<std::thread> threads;
+	join_threads joiner;
+	unsigned const thread_count = std::thread::hardware_concurrency();
+
+	// 静态非常量成员必须在类外进行初始化
+	static thread_local threadsafe_queue<function_wrapper>* local_work_queue;
+	static thread_local unsigned my_index;
+
+	void worker_thread(unsigned my_index_)
+	{
+		my_index = my_index_;
+		local_work_queue = queues[my_index].get();
+		while (!done)
+		{
+			run_pending_task();
+		}
+	}
+
+	bool pop_task_from_local_queue(task_type& task)
+	{
+		return local_work_queue && local_work_queue->try_pop(task);
+	}
+
+	bool pop_task_from_pool_queue(task_type& task)
+	{
+		return pool_work_queue.try_pop(task);
+	}
+
+	bool pop_task_from_other_thread_queue(task_type& task)
+	{
+		for (unsigned i = 0; i < queues.size(); ++i)
+		{
+			// 避免每个线程都从第一个线程获取任务
+			unsigned const index = (my_index + i + 1) % queues.size();
+			if (index != my_index && queues[index]->try_pop(task))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+public:
+	thread_pool() :
+		done(false), joiner(threads)
+	{
+		try
+		{
+			for (unsigned i = 0; i<thread_count; ++i)
+			{
+				queues.push_back(std::unique_ptr<threadsafe_queue<function_wrapper> >(
+					new threadsafe_queue<function_wrapper>));
+				threads.push_back(
+					std::thread(&thread_pool::worker_thread, this, i));
+			}
+		}
+		catch (...)
+		{
+			done = true;
+			throw;
+		}
+	}
+
+	~thread_pool()
+	{
+		done = true;
+	}
+
+	template<typename FunctionType>
+	std::future<typename std::result_of<FunctionType()>::type> submit(
+		FunctionType f)
+	{
+		typedef typename std::result_of<FunctionType()>::type result_type;
+		std::packaged_task<result_type()> task(f);
+		std::future<result_type> res(task.get_future());
+		if (local_work_queue)
+		{
+			local_work_queue->push(std::move(task));
+		}
+		else
+		{
+			pool_work_queue.push(std::move(task));
+		}
+		return res;
+	}
+
+	void run_pending_task()
+	{
+		task_type task;
+		if (pop_task_from_local_queue(task) ||
+			pop_task_from_pool_queue(task) ||
+			((queues.size() == thread_count) && pop_task_from_other_thread_queue(task)))
+		{
+			task();
+		}
+		else
+		{
+			std::this_thread::yield();
+		}
+	}
+};
+
+thread_local threadsafe_queue<function_wrapper>* thread_pool::local_work_queue = nullptr;
+thread_local unsigned thread_pool::my_index = 0;
+
+template<typename T>
+struct sorter
+{
+	thread_pool pool;
+	std::list<T> do_sort(std::list<T>& chunk_data)
+	{
+		if (chunk_data.empty())
+		{
+			return chunk_data;
+		}
+
+		std::list<T> result;
+		result.splice(result.begin(), chunk_data, chunk_data.begin());
+		T const& partition_val = *result.begin();
+
+		typename std::list<T>::iterator divide_point =
+			std::partition(chunk_data.begin(), chunk_data.end(),
+				[&](T const& val) {return val<partition_val; });
+
+		std::list<T> new_lower_chunk;
+		new_lower_chunk.splice(new_lower_chunk.end(),
+			chunk_data, chunk_data.begin(),
+			divide_point);
+		std::future<std::list<T> > new_lower =
+			pool.submit(std::bind(&sorter::do_sort, this,
+				std::move(new_lower_chunk)));
+
+		std::list<T> new_higher(do_sort(chunk_data));
+		result.splice(result.end(), new_higher);
+		while (new_lower.wait_for(std::chrono::seconds(0)) !=
+			std::future_status::ready)
+		{
+			pool.run_pending_task();
+		}
+
+		result.splice(result.begin(), new_lower.get());
+		return result;
+	}
+};
+
+template<typename T>
+std::list<T> parallel_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	sorter<T> s;
+	return s.do_sort(input);
+}
+
+template<typename T>
+std::list<T> sequential_quick_sort(std::list<T> input)
+{
+	if (input.empty())
+	{
+		return input;
+	}
+	std::list<T> result;
+	// l.splice(iterator pos,list& x, iterator i)
+	// 将x中i指向的元素移动插入到l中pos指向的位置之前
+	result.splice(result.begin(), input, input.begin());
+	T const& pivot = *result.begin();
+
+	// std::partition(iterator beg, iterator end, func)
+	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
+	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
+	auto divide_point = std::partition(input.begin(), input.end(),
+		[&](T const& t) {return t<pivot; });
+
+	std::list<T> lower_part;
+	// l.splice(iterator pos,list& x, iterator beg, iterator end)
+	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
+	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
+
+	auto new_lower(
+		sequential_quick_sort(std::move(lower_part)));
+	auto new_higher(
+		sequential_quick_sort(std::move(input)));
+
+	// l.splice(iterator pos,list& x)
+	// 将x中所有元素移动插入到l中pos指向的位置之前
+	result.splice(result.end(), new_higher);
+	result.splice(result.begin(), new_lower);
+	return result;
+}
+
+int main()
+{
+	// 随机数生成
+	std::list<int> nums;
+	std::uniform_int_distribution<unsigned> u(0, 1000);
+	std::default_random_engine e;
+	for (int i = 0; i < 1000; ++i) {
+		nums.push_back(u(e));
+	}
+
+	std::list<int> result1, result2;
+
+	auto time_start = std::chrono::high_resolution_clock::now();
+	result1 = sequential_quick_sort<int>(nums);
+	auto time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "sequential_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	time_start = std::chrono::high_resolution_clock::now();
+	try {
+		result2 = parallel_quick_sort<int>(nums);
+	}
+	catch (std::exception &e) {
+		std::cout << e.what();
+	}
+	time_end = std::chrono::high_resolution_clock::now();
+	std::cout << "parallel_quick_sort tooks "
+		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
+		<< " ms\n";
+
+	/*for (auto &i : result1)
+	{
+		std::cout << i << " ";
+	}
+	std::cout << "\n";
+	for (auto &i : result2)
+	{
+		std::cout << i << " ";
+	}*/
+}
+```
+
+结果：
+
+```text
+sequential_quick_sort tooks 74.7177 ms
+parallel_quick_sort tooks 62.3508 ms
+
+```
+
+虽然在`pop_task_from_other_thread_queue`的guard是`queues.size()`，但是如果不在`run_pending_task`中判断`queues.size() == thread_count`的话，就会发生异常。**这个线程池对于很多场景都能很好的工作**，一个不好的地方就是：**不能动态改变线程的数量**。
+
+<h3 id="interrupting_threads">线程中断</h3>
 
