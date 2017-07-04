@@ -25,6 +25,9 @@ tags:
 *	[高级线程管理](#advanced_thread_management)
 	*	[线程池(thread pool)](#thread_pool)
 	*	[线程中断](#interrupting_threads)
+*	[多线程程序的测试与调试](#testing_and_debugging_multithreaded_applications)
+	*	[与并发相关的错误类型](#types_of_concurrency_related_bugs)
+	*	[查找并发相关错误的技术](#techniques_for_locating_concurrency_related_bugs)
 
 <h2 id="design_concurrent_code">并发代码设计</h2>
 
@@ -3444,3 +3447,485 @@ parallel_quick_sort tooks 62.3508 ms
 
 <h3 id="interrupting_threads">线程中断</h3>
 
+如果一个线程运行的时间特别长、或者用户操作失误、或者其它什么原因，你都需要从一个线程中发出信号来通知另一个线程停止运行，我们称之为线程中断。
+
+#### 线程的启动与中断
+
+由于C++标准库并没有提供线程中断的工具，所以我们需要自己构建一个。
+
+```c++
+class interruptible_thread
+{
+public:
+	template<typename FunctionType>
+	interruptible_thread(FunctionType f);
+
+	void join();
+	void detach();
+	bool joinable() const;
+	void interrupt();
+};
+```
+
+`interruptible_thread`类只是比`std::thread`类多了一个`interrupt`接口。你可以就使用`std::thread`来管理线程，并自定义一些数据结构来处理中断；但是如果从线程的角度来看的话，就会需要一个中断点，为了不传递其它额外的数据，我们定义一个无参函数`interruption_point()`，该函数可以通过线程启动时设置的`thread_local`标志的状态选择性的制造一个中断点。
+
+由于这个`thread_local`标志必须以`interruptible_thread`实例可以访问的方式进行分配，所以你不能直接使用`std::thread`来管理中断线程，但是你可以把这个`thread_local`标志包装到线程函数中：
+
+```c++
+class interrupt_flag
+{
+public:
+	void set();
+	bool is_set() const;
+};
+
+thread_local interrupt_flag this_thread_interrupt_flag;
+class interruptible_thread
+{
+	std::thread internal_thread;
+	interrupt_flag* flag;
+
+public:
+	template<typename FunctionType>
+	interruptible_thread(FunctionType f)
+	{
+		std::promise<interrupt_flag*> p;
+		internal_thread = std::thread([f, &p] {
+			p.set_value(&this_thread_interrupt_flag);
+			f();
+		});
+		flag = p.get_future().get();
+	}
+
+	void interrupt()
+	{
+		if (flag)
+		{
+			flag->set();
+		}
+	}
+
+	~interruptible_thread()
+	{
+		flag = nullptr;
+		if (internal_thread.joinable())
+		{
+			internal_thread.join();
+		}
+	}
+};
+```
+
+`this_thread_interrupt_flag`是`thread_local`修饰的，所以每个线程都有一个独立的实例，flag指向的地址也是不同的；很明显，我们将传递的线程函数通过lambda包装到了一起；注意当线程退出之后，对flag进行清理，以避免悬空指针；你也可以自定义join、detach、joinable以便用户进行选择。
+
+#### 检测线程已被中断
+
+当`thread_local`标志被设置后，就可以通过`interruption_point`函数来制造一个中断点，通常你可以抛出一个异常来达到这一目的：
+
+```c++
+void interruption_point()
+{
+	if (this_thread_interrupt_flag.is_set())
+	{
+		throw thread_interrupted();
+	}
+}
+```
+
+有了`interruption_point`这个函数，现在你可以将其放置在线程函数的主循环内：
+
+```c++
+void foo()
+{
+	while (!done)
+	{
+		interruption_point();
+		process_next_item();
+	}
+}
+```
+
+这样，当`thread_local`标志被设置后，线程函数就会抛出异常，停止运行，继而实现线程中断。**中断线程最好的地方是线程阻塞的地方，因为这意味着线程没有在运行**，所以是调用`interruption_point`最好的地方，你需要一种以可中断的方式等待某事的方法。
+
+#### 中断一个condition variable的等待
+
+当线程在做一个阻塞等待的时候，`interruption_point`将找不到合适的位置进行调用，所以需要一个新的函数`interruptible_wait()`，该函数可以随时中断任何等待事件。
+
+那么如何才能中断一个`condition_variable`的等待事件呢？一种简单的方法就是：一旦中断标志被设置，就立即notify这个`condition_variable`变量，并在这个`condition_variable`变量wait语句的后面立即调用`interruption_point`函数。要想这个方法能够生效，中断notify必须是`notify_all`，这样才能确保要中断的线程被中断了；`interrupt_flag`也需要保存一个`condition_variable`变量的指针，这样才能在set函数里面调用`notify_all`。
+
+一个`interruptible_wait`的实现如下：
+
+```c++
+void interruptible_wait(std::condition_variable& cv,
+	std::unique_lock<std::mutex>& lk)
+{
+	interruption_point();
+	this_thread_interrupt_flag.set_condition_variable(cv);
+	cv.wait(lk);
+	this_thread_interrupt_flag.clear_condition_variable();
+	interruption_point();
+}
+```
+
+很明显，该函数首先检查中断，然后关联中断flag到这个条件变量，做完等待后清除关联，这样能避免悬空指针，最后在做一次中断检查。这个函数看上去不错，但却是不可用的：
+
+*	一个原因是因为条件变量的wait操作可能发生异常导致没有清除中断flag与条件变量的关联，继而导致悬空指针，你可以简单的将清除关联这个操作放到析构函数里面来解决这个问题；
+*	另一个不明显的原因是条件竞争：如果你在第一次中断检查之后、`cv.wait`之前，或者`cv.wait`之后、第二次中断检查之前进行中断，那么set函数中的`notify_all`就没有了作用(不久前我遇到过这种问题，我解决的方法是用`std::promise`，因为不管在get之前set还是在get之后set都没关系，但那个时候是一次set一次get，很显然这里可能set两次)，解决方法就是将wait改为`wait_for`，这样每隔一段时间就出来检查一下，不管什么时候进行中断，都能快速响应：
+
+```c++
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <future>
+
+class interrupt_flag
+{
+	std::atomic<bool> flag;
+	std::condition_variable* thread_cond;
+	std::mutex set_clear_mutex;
+
+public:
+	interrupt_flag() :
+		thread_cond(0)
+	{}
+
+	void set()
+	{
+		flag.store(true, std::memory_order_relaxed);
+		std::lock_guard<std::mutex> lk(set_clear_mutex);
+		if (thread_cond)
+		{
+			thread_cond->notify_all();
+		}
+	}
+
+	bool is_set() const
+	{
+		return flag.load(std::memory_order_relaxed);
+	}
+
+	void set_condition_variable(std::condition_variable& cv)
+	{
+		std::lock_guard<std::mutex> lk(set_clear_mutex);
+		thread_cond = &cv;
+	}
+
+	void clear_condition_variable()
+	{
+		std::lock_guard<std::mutex> lk(set_clear_mutex);
+		thread_cond = nullptr;
+	}
+};
+
+thread_local interrupt_flag this_thread_interrupt_flag;
+class interruptible_thread
+{
+	std::thread internal_thread;
+	interrupt_flag* flag;
+
+public:
+	template<typename FunctionType>
+	interruptible_thread(FunctionType f)
+	{
+		std::promise<interrupt_flag*> p;
+		internal_thread = std::thread([f, &p] {
+			p.set_value(&this_thread_interrupt_flag);
+			f();
+		});
+		flag = p.get_future().get();
+	}
+
+	void interrupt()
+	{
+		if (flag)
+		{
+			flag->set();
+		}
+	}
+
+	~interruptible_thread()
+	{
+		flag = nullptr;
+		if (internal_thread.joinable())
+		{
+			internal_thread.join();
+		}
+	}
+};
+
+struct thread_interrupted : std::exception
+{
+	const char* what() const throw()
+	{
+		return "thread interrupted.\n";
+	}
+};
+
+void interruption_point()
+{
+	if (this_thread_interrupt_flag.is_set())
+	{
+		throw thread_interrupted();
+	}
+}
+
+struct clear_cv_on_destruct
+{
+	~clear_cv_on_destruct()
+	{
+		this_thread_interrupt_flag.clear_condition_variable();
+	}
+};
+
+template<typename Predicate>
+void interruptible_wait(std::condition_variable& cv,
+	std::unique_lock<std::mutex>& lk,
+	Predicate pred)
+{
+	interruption_point();
+	this_thread_interrupt_flag.set_condition_variable(cv);
+	clear_cv_on_destruct guard;
+	while (!this_thread_interrupt_flag.is_set() && !pred())
+	{
+		cv.wait_for(lk, std::chrono::milliseconds(1));
+	}
+	interruption_point();
+}
+```
+
+现在来对这个`interruptible_thread`做一个中断测试：
+
+```c++
+#include <iostream>
+#include "interrupt_thread.h"
+
+void foo(std::promise<void> &f)
+{
+	while (1)
+	{
+		try {
+			interruption_point();
+		}
+		catch (thread_interrupted &e)
+		{
+			f.set_exception(
+				std::make_exception_ptr(e)
+			);
+			break;
+		}
+		std::this_thread::sleep_for(
+			std::chrono::duration<double,std::milli>(1)
+		);
+	}
+}
+
+int main()
+{
+	std::promise<void> f;
+	interruptible_thread t(std::bind(foo,std::ref(f)));
+
+	getchar();
+	t.interrupt();
+
+	try {
+		f.get_future().get();
+	}
+	catch (thread_interrupted &e)
+	{
+		std::cout << e.what();
+	}
+
+}
+```
+
+结果：
+
+```text
+ew
+thread interrupted.
+
+```
+
+答案是能够正常运行，为了将异常传递到主线程，我传递了一个promise变量，当中断发生的时候就设置一个异常在里面，在主线程调用get时就会重新抛出；`getchar()`用来控制中断发生的时间；如果foo由于其它异常导致退出以至于f没有调用`set_exception`，那么主线程将会一直在get处等待，当然这永远不会发生，因为foo不可能发生其他异常。
+
+如果你想在foo中直接处理异常，也可以修改为如下代码，结果一样：
+
+```c++
+#include <iostream>
+#include "interrupt_thread.h"
+
+void foo()
+{
+	while (1)
+	{
+		try {
+			interruption_point();
+		}
+		catch (thread_interrupted &e)
+		{
+			std::cout << e.what();
+			break;
+		}
+		std::this_thread::sleep_for(
+			std::chrono::duration<double,std::milli>(1)
+		);
+	}
+}
+
+int main()
+{
+	interruptible_thread t(foo);
+
+	getchar();
+	t.interrupt();
+}
+```
+
+再做一个中断等待测试：
+
+```c++
+#include <iostream>
+#include "interrupt_thread.h"
+
+void foo()
+{
+	std::condition_variable cv;
+	std::mutex mtx;
+	std::unique_lock<std::mutex> lk(mtx);
+
+	while (1)
+	{
+		try {
+			interruptible_wait(cv, lk, [] {return false; });
+		}
+		catch (thread_interrupted &e)
+		{
+			std::cout << e.what();
+			break;
+		}
+
+		std::this_thread::sleep_for(
+			std::chrono::duration<double,std::milli>(1)
+		);
+	}
+}
+
+int main()
+{
+	interruptible_thread t(foo);
+
+	getchar();
+	t.interrupt();
+}
+```
+
+结果：
+
+```text
+asd
+thread interrupted.
+
+```
+
+#### 中断其它阻塞调用
+
+除了`condition_variable`有wait操作外，`std::future`、`std::mutex`等也有wait操作，仿照条件变量的实现，future的实现也很容易：
+
+```c++
+template<typename T>
+void interruptible_wait(std::future<T>& uf)
+{
+	while (!this_thread_interrupt_flag.is_set())
+	{
+		if (uf.wait_for(std::chrono::milliseconds(1)) ==
+			std::future_status::ready)
+			break;
+	}
+	interruption_point();
+}
+```
+
+然后稍微做个测试：
+
+```c++
+#include <iostream>
+#include "interrupt_thread.h"
+
+void foo()
+{
+	std::condition_variable cv;
+	std::future<void> uf = std::async([] { // future必须被赋值，不然将会抛出异常
+		int i = 0;
+		while (++i < 1000)
+		{
+			std::this_thread::sleep_for(
+				std::chrono::duration<double, std::milli>(1)
+			);
+		}
+	});
+
+	while (1)
+	{
+		try {
+			interruptible_wait(uf);
+		}
+		catch (thread_interrupted &e)
+		{
+			std::cout << e.what();
+			break;
+		}
+
+		std::this_thread::sleep_for(
+			std::chrono::duration<double,std::milli>(1)
+		);
+	}
+}
+
+int main()
+{
+	interruptible_thread t(foo);
+
+	getchar();
+	t.interrupt();
+}
+```
+
+结果：
+
+```text
+d
+thread interrupted.
+
+```
+
+<h2 id="testing_and_debugging_multithreaded_applications">多线程程序的测试与调试</h2>
+
+<h3 id="types_of_concurrency_related_bugs">与并发相关的错误类型</h3>
+
+与并发相关的错误类型通常分为两大类：
+
+*	不必要的阻塞；
+*	条件竞争。
+
+#### 不必要的阻塞
+
+什么时候的阻塞是不必要的呢？
+
+*	死锁(deadlock)：两个线程相互等待，使得都不能正常工作，这样的阻塞是不必要的；
+*	活锁(livelock)：两个线程过独木桥，必须一个先过才能解决问题，不然就会一直不停循环，还会占用CPU，这样的阻塞也是不必要的；
+*	I/O或其它外部输入：如果线程A在等待输入，那么它就不能做事，这时如果另一个线程B在等待线程A执行某些操作，那么B的阻塞就是不必要的；
+
+#### 条件竞争
+
+条件竞争在多线程代码中很常见——很多条件竞争表现为死锁与活锁。但并非所有条件竞争都是恶性的，很多条件竞争是良性的，例如对任务列表中任务的竞争，不管哪个任务先执行都没有关系。
+
+条件竞争通常会产生以下几种类型的错误：
+
+*	数据竞争(data races)：如果并发的去修改一个独立对象，那么很可能某个线程在读取该独立对象的时候会读到错误的数据；
+*	破坏的不变量(broken invariants)：所谓不变量就是指状态很稳定，这个词不太好描述，之前的文章很少使用它，通俗一点就是--当前数据结构没有处于正在被修改状态。如果一个数据结构正在被一个线程修改，并且另一个线程能够看到该数据结构在修改过程中的中间状态，那么就称这个数据结构的不变量被破坏了。很明显，破坏的不变量可能导致读取到不正确的数据；
+*	生命周期问题(lifetime issues)：如果一个数据被删除或移动了，另一个线程还在对其进行访问，就会发生未定义行为。这通常发生在对局部变量的引用或其指针的传递使用上。
+
+<h3 id="techniques_for_locating_concurrency_related_bugs">查找并发相关错误的技术</h3>
+
+查找bug最简单的方法就是直接查看代码，有时候你会需要一个[小黄鸭](https://zh.wikipedia.org/wiki/%E5%B0%8F%E9%BB%84%E9%B8%AD%E8%B0%83%E8%AF%95%E6%B3%95)，但这只能找出很容易察觉的问题，很多设计上的问题是查找不出来的，你必须慢慢调试运行才能解决。
