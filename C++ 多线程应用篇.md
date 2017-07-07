@@ -1,6 +1,6 @@
 ---
 title:      "C++ 多线程应用篇"
-subtitle:   "Concurrency In Action"
+subtitle:   "代码设计、管理及调试"
 date:       2017-06-8 20:20:00 +0800
 header-img: "img/stock-photo-7.jpg"
 tags:
@@ -347,11 +347,11 @@ par: 53.8802ms
 
 单线程中，当有多个任务需要在一段时间内连续不断的运行时，或者程序在其它任务正在进行的情况下仍然需要能够及时处理输入事件(如用户键盘输入、网络数据输入等)时，程序不得不使用单一责任原则(single responsibility principle)来处理这些冲突。在单线程世界里，要处理上面的场景，程序需要先处理一部分任务A，再处理一部分任务B，然后检查是否有用户输入、检查是否有网络数据输入，然后再循环回去继续执行另一部分的任务A...这意味着任务A会变得复杂化，因为它不得不保存它的状态信息，并周期性的返回到主循环中；如果你添加了太多任务到这个循环中，那么用户输入的响应就会变得很慢。有个特殊形式的这种情况相信很多人都见过：当你使程序做一项任务时，接口封锁直到任务完成。
 
-这就是线程诞生的地方。如果你在不同线程中运行每个任务，那么操作系统会为你处理上面的问题。在任务A的代码里，你只需要专注于如何完成这个任务，而不用担心状态的保存、返回到主循环、更不用担心你做这个任务花费了多少时间。操作系统在何时的时候会在适当的时候帮你保存状态，然后切换到任务B或任务C(任务切换)，如果系统拥有多个内核或处理器的话，任务A和B也许可以达到真正的并发(硬件并发)。现在用户等到及时响应了，作为开发者你也简化了自己的代码，因为每个线程都可以专注于直接与其职责相关的操作，再也不必将控制分支与用户交互混合在一起了。
+这就是线程诞生的地方。如果你在不同线程中运行每个任务，那么操作系统会为你处理上面的问题。在任务A的代码里，你只需要专注于如何完成这个任务，而不用担心状态的保存、返回到主循环、更不用担心你做这个任务花费了多少时间。操作系统会在适当的时候帮你保存状态，然后切换到任务B或任务C(任务切换)，如果系统拥有多个内核或处理器的话，任务A和B也许可以达到真正的并发(硬件并发)。现在用户等到及时响应了，作为开发者你也简化了自己的代码，因为每个线程都可以专注于直接与其职责相关的操作，再也不必将控制分支与用户交互混合在一起了。
 
 这听起来很美好，但是真的能够实现么？如果所有任务都是相互独立的，线程间也不必相互通信，那么它就是这么easy。然而不幸的是，现实并没有那么美好，这些美好的后台线程经常被要求做一些用户要求做的事情，并且他们需要通过以某种方式更新用户界面来让用户知道他们什么时候完成；或者用户可能想要取消或停止某个后台线程。这两个场景都需要小心的思考、设计并适当的同步，但是**关注的问题仍然是分离的(the concerns are still separate)**：用户接口线程仍然只需要处理用户输入，但是它可能在被其它线程要求做某件事时发生更新；同样的，后台任务仍然只需要关注其任务的实现，只是有时会发生“允许任务被其他线程停止”的情况。
 
-你可能会分离成错误的关注点，线程间共享了大量的数据，或不同线程间相互等待，这两种情况都归结为线程间使用了太多的通信。**如果所有的通信都涉及到相同的问题，也许应该是一个线程的关键责任，并从引用它的所有线程中提取出来；或者如果两个线程通信很密切，但是与其它线程却通信很少，也许它们应该被合并在同一个线程中**；
+你可能会分离成错误的关注点，线程间共享了大量的数据，或不同线程间相互等待，这两种情况都归结为线程间使用了太多的通信。**如果所有的通信都涉及到相同的问题，也许是一个线程的关键责任，应该从引用它的所有线程中提取出来；或者如果两个线程通信很密切，但是与其它线程却通信很少，也许它们应该被合并在同一个线程中**；
 
 **当使用任务类型来划分工作时，你不必将自己限制在完全独立的情况下，如果多组输入数据需要相同的操作顺序，你可以将序列中的操作分成多个阶段(stage)，然后分配给每个线程**。
 
@@ -361,15 +361,15 @@ par: 53.8802ms
 
 通过在线程间划分工作而非数据，你改变了实现的属性。假设您有20个数据项要处理，在四个内核上，每个数据项需要四个步骤，每个步骤需要3秒钟。如果您在四个线程之间划分数据，那么每个线程都有5个数据项要处理，假设没有其他可能会影响时间的处理，12秒后，你将处理4个数据项，那么所有20个数据项一共需要60秒；如果你使用流水线(pipeline)的话，这四个步骤可以被分配到每个内核，现在第一个数据项会被每个内核处理，所以仍然需要12秒，然而12秒之后，一个数据项只需要3秒即可被处理，所以现在全部完成就需要3*19+12=69秒，发现多了9秒，原因是最后一个内核在开始处理第一个数据项时，不得不等待9秒。
 
-**在一些情况下，更平稳，更固定的处理可能是有益的**。例如，考虑一个观看高分辨率数字视频的系统，为了让视频可以观看，通常需要每秒至少25帧或者更多，用户需要这些均匀间隔以给人持续运动的印象；每秒可以解码100帧的应用程序是没有在使用的，如果它暂停一秒钟，然后显示100帧，然后再暂停一秒钟，显示另外100帧；另一方面，用户可能很乐意在开始观看视频前延迟几秒钟。在这种情况下，使用以良好的稳定速率输出帧的管道进行并行化可能会更好。
+**在一些情况下，更平稳，更固定的处理可能是有益的**。例如，考虑一个观看高分辨率数字视频的系统，为了让视频可以观看，通常需要每秒至少25帧或者更多，用户需要这些均匀间隔以给人持续运动的印象。如果还是四个内核，每个内核每秒能处理25帧，那么使用划分数据的方式，每暂停一秒钟，就会显示100帧，然后再暂停一秒钟，显示另外100帧；另一方面，使用流水线的话，虽然一开始会有一定时间的延迟，但是后面每秒都会稳定的显示25帧。用户可能很乐意在开始观看视频前延迟几秒钟，在这种情况下，使用以良好的稳定速率输出帧的管道进行并行化可能会更好。
 
 <h3 id="factors_affecting_the_performance_of_concurrent_code">影响并发代码性能的因素</h3>
 
 **处理器的数量是影响多线程程序性能的一个至关重要的因素**。如果你对目标硬件非常熟悉，那么你可以针对硬件进行设计，但是大多数情况下并不是这样--你可能在一个类似的系统上进行开发，所以与目标系统的差异就显得至关重要了。例如，你在一个双核或者四核的系统上进行开发，但是用户的系统却只有一个多核处理器(带有多个内核)、或者多个单核处理器、甚至多个多核处理器，**在不同平台上，并发程序的行为和性能特点就可能完全不同，所以你需要仔细考虑那些地方会被影响到，如果会被影响，就需要在不同平台上进行测试**。
 
-一个16核处理器与4个四核处理器或16个单核处理器相同--可以同时运行16个线程。如果你想利用这一点，你的程序必须拥有至少16个线程；少于16个将会有空闲的处理器(不考虑其他程序运行的消耗)，但是多于16个将会浪费处理器的运算时间在线程间的任务切换上，这被称为超额认购(oversubscription)。为了允许应用程序根据硬件可以同时运行的线程数量来扩展线程数，C++11标准线程库提供了`std::thread::hardware_concurrency()`，本文最开始的示例也展示了对该函数的使用。
+一个16核处理器与4个四核处理器或16个单核处理器相同--可以同时运行16个线程。如果你想利用这一点，你的程序必须拥有至少16个线程；少于16个将会有空闲的处理器(不考虑其他程序运行的消耗)，但是多于16个将会浪费处理器的运算时间在线程间的任务切换上，这被称为**超额认购(oversubscription)**。为了允许应用程序根据硬件可以同时运行的线程数量来扩展线程数，C++11标准线程库提供了`std::thread::hardware_concurrency()`，本文最开始的示例也展示了对该函数的使用。
 
-直接使用`std::thread::hardware_concurrency()`需要特别小心，因为代码不会考虑其它运行在该系统上的线程，除非你分享了这个信息。最坏的情况是：如果有多个线程同时调用了一个使用了`std::thread::hardware_concurrency()`的函数来扩展线程数，就会导致庞大的超额认购(oversubscription)。`std::async()`可以避免这个问题，因为标准库知道所有的调用，并能进行适当的安排；小心使用线程池也能避免这个问题。
+**直接使用`std::thread::hardware_concurrency()`需要特别小心，因为代码不会考虑其它运行在该系统上的线程，除非你分享了这个信息**。最坏的情况是：**如果有多个线程同时调用了一个使用了`std::thread::hardware_concurrency()`的函数来扩展线程数，就会导致庞大的超额认购(oversubscription)**。`std::async()`可以避免这个问题，因为标准库知道所有的调用，并能进行适当的安排；小心使用线程池也能避免这个问题。
 
 但是，**即使你考虑到应用程序中运行的所有线程，仍然会受到同时运行的其他应用程序的影响**。一个选项是使用与`std::async()`类似的工具，来为所有执行异步任务的线程的数量做考虑;另一个选项是限制给定应用程序可以使用的处理核心数量。
 
@@ -377,7 +377,7 @@ par: 53.8802ms
 
 #### Data contention and cache ping-pong
 
-如果两个线程在两个不同的处理器上同时运行，并且它们都在读相同的数据，这通常不会造成问题，因为数据可以被拷贝到各自的缓冲中去；然而，如果有线程修改数据的话，这个修改就需要被更新到其它内核的缓冲区中去，这需要消耗一些时间。根据两个线程上的操作的性质以及用于操作的存储顺序(memory order)，这样的修改可能会让第二个处理器停下来，等待硬件内存更新缓存中的数据。在CPU指令方面，这可能是一个非常慢的操作，相当于数百个单独的指令，尽管精确的时序主要取决于硬件的物理结构。
+如果两个线程在两个不同的处理器上同时运行，并且它们都只读相同的数据，这通常不会造成问题，因为数据可以被拷贝到各自的缓冲中去；然而，如果有线程修改数据的话，这个修改就需要被更新到其它内核的缓冲区中去，这需要消耗一些时间。根据两个线程上的操作的性质以及用于操作的存储顺序(memory order)，这样的修改可能会让第二个处理器停下来，等待硬件内存更新缓存中的数据。在CPU指令方面，这可能是一个非常慢的操作，相当于数百个单独的指令，尽管精确的时序主要取决于硬件的物理结构。
 
 考虑如下代码：
 
@@ -413,7 +413,7 @@ void processing_loop_with_mutex()
 
 #### False sharing
 
-**处理器缓存通常不会用来处理在单个内存位置(memory location)，但其会用来处理称为高速缓存行(cache line)的内存块**。这些内存块大小通常为32或64字节，但具体细节取决于所使用的特定处理器型号。由于高速缓存硬件仅在高速缓存行(cache line)大小的内存块中进行处理，所以相邻内存位置(memory location)中的小数据项将位于相同的高速缓存行(cache line)中。有时候这是很好的：如果线程访问的数据集在同一个cache line中，那么程序性能会比数据集分布多个cache line中要好。然而，如果cache line中的数据项是不相关的，且需要被不同线程访问，这就会导致一个主要的性能问题。
+**处理器缓存通常不会用来处理单个内存位置(memory location)，但其会用来处理称为高速缓存行(cache line)的内存块**。这些内存块大小通常为32或64字节，但具体细节取决于所使用的特定处理器型号。由于高速缓存硬件仅在高速缓存行(cache line)大小的内存块中进行处理，所以相邻内存位置(memory location)中的小数据项将位于相同的高速缓存行(cache line)中。有时候这是很好的：如果线程访问的数据集在同一个cache line中，那么程序性能会比数据集分布多个cache line中要好。然而，如果cache line中的数据项是不相关的，且需要被不同线程访问，这就会导致一个主要的性能问题。
 
 假设你有一个int数组和一个线程集，每个线程都访问数组中的自己的条目，但重复执行，包括更新。由于int通常比缓存行小得多，所以相当数量的条目将在同一个cache line中，所以即使每个线程只访问自己的数组条目，但仍然发生了“乒乓缓存”(cache ping-pong)：每次访问条目0的线程A需要更新值时，需要将cache line的所有权传输到运行A的处理器，当访问条目1的线程B需要更新值时，cache line的所有权又被传输到运行B的处理器。虽然没有数据是共享的，但是cache line却是共享的，这就是术语false sharing的由来。这里的解决方案是**结构化数据，使得同一线程要访问的数据项在内存中相互靠近（从而更可能在同一个cache line中），而不同线程访问的数据项在内存中相互远离，因此更有可能在单独的cache line中**。
 
@@ -425,7 +425,7 @@ false sharing是由于一个线程访问的数据太靠近另一个线程访问�
 
 #### Oversubscription and excessive task switching
 
-**在多线程系统中，线程数通常比处理器数要多，除非你使用的是大型并发系统**。然而线程经常花费时间等待外部I/O、或等待mutex、或等待条件变量等等，所以拥有额外的线程使得程序能够执行有用的工作，而不是让处理器在等待时处于空闲状态。但是当线程数太多，以致等待运行的线程数超过了可用的处理器数时，系统就会开始任务切换，这也会增加时间开销，当一个任务重复产生新线程而不受控制时，可能会出现超额认购(oversubscription)。
+**在多线程系统中，线程数通常比处理器数要多，除非你使用的是大型并发系统**。然而线程经常花费时间等待外部I/O、或等待mutex、或等待条件变量等等，所以程序通常拥有额外的线程执行有用的工作，而不是让处理器在等待时处于空闲状态。但是当线程数太多，以致等待运行的线程数超过了可用的处理器数时，系统就会开始任务切换，这也会增加时间开销，当一个任务重复产生新线程而不受控制时，可能会出现超额认购(oversubscription)。
 
 <h3 id="designing_data_structures_for_multithreaded_performance">为多线程性能设计数据结构</h3>
 
@@ -442,11 +442,11 @@ false sharing是由于一个线程访问的数据太靠近另一个线程访问�
 
 假设这两个超大的矩阵拥有上千行、上千列，那么使用多线程可以优化该乘法。通常，非稀疏矩阵在内存中用一个大数组表示，第二行的所有元素跟随在第一行的所有元素之后，以此类推。为了做矩阵乘法，你需要三个这样的大数组，两个用于相乘，一个用于结果。
 
-你可以使用多种方法来划分工作。如果你的行列数超过了可用的处理器数，那么你可以让每个线程计算一定数量的结果元素，可以是几行、几列、或者一个子矩阵，都没问题。但是我们知道，**访问连续的元素会比访问分散的元素要好**，因为前者会减少缓存的使用量和false sharing的概率。
+你可以使用多种方法来划分工作。如果你的行列数超过了可用的处理器数，那么你可以让每个线程计算一定数量的结果元素，可以是几行、几列、或者一个子矩阵，都没问题。但是我们知道，**访问连续的元素会比访问分散的元素要好**，因为前者会减少cache line的使用量和false sharing的概率。
 
-现在假设第一个矩阵A是N行M列，第二个矩阵B是M行K列，且每行元素使用一个cache line。如果每个线程计算结果C的一行元素，那么一个线程使用的cache line数为1+M+1，其中只有对B的数据的访问是分散的，各个线程使用的A和C的cache line都是不同的；如果每个线程计算结果C的一列元素，那么一个线程使用的cache line数为N+M+N，各个线程使用的cache line都是一样的，这不仅会增加缓存的使用量，还会增加false sharing的概率；如果每个线程计算结果C的一个PxQ子矩阵元素，那么一个线程使用的cache line数为P+Q+P，各个线程使用的cache line可能相同，但相对于第一种方法，可能会减少缓存的使用量。
+现在假设第一个矩阵A是N行M列，第二个矩阵B是M行K列，且每行元素使用一个cache line。如果每个线程计算结果C的一行元素，那么一个线程使用的cache line数为1+M+1，其中只有对B的数据的访问是分散的，各个线程使用的A和C的cache line都是不同的；如果每个线程计算结果C的一列元素，那么一个线程使用的cache line数为N+M+N，各个线程使用的cache line都是一样的，这不仅会增加缓存的使用量，还会增加false sharing的概率；如果每个线程计算结果C的一个PxQ子矩阵元素，那么一个线程使用的cache line数为P+M+P，各个线程使用的cache line可能相同，但相对于第一种方法，可能会减少缓存的使用量。
 
-考虑两个1000x1000的矩阵相乘，你有100个处理器。如果每个处理器处理结果的10行元素，那么需要访问第一个矩阵的10x1000个元素，第二个矩阵的1000x1000个元素，结果矩阵的10x1000个元素，一共需要访问1020000个元素；如果每个处理器处理结果的100x100子矩阵元素，那么需要访问第一个矩阵的100x1000个元素，第二个矩阵的100x1000个元素，结果矩阵的100x100个元素，一共需要访问210000个元素，是处理10行元素访问元素的五分之一，所以会更好的提升性能。
+考虑两个1000x1000的矩阵相乘，你有100个处理器。如果每个处理器处理结果的10行元素，那么需要访问第一个矩阵的10x1000个元素，第二个矩阵的1000x1000个元素，结果矩阵的10x1000个元素，一共需要访问1020000个元素；如果每个处理器处理结果的100x100子矩阵元素，那么需要访问第一个矩阵的100x1000个元素，第二个矩阵的1000x100个元素，结果矩阵的100x100个元素，一共需要访问210000个元素，是处理10行元素访问元素的五分之一，所以会更好的提升性能。
 
 **将工作划分为小块可能会工作的更好，你可以根据源矩阵的大小和处理器的数量来动态的对块的大小进行调整**。
 
@@ -470,7 +470,7 @@ false sharing是由于一个线程访问的数据太靠近另一个线程访问�
 
 <h3 id="additional_considerations_when_designing_for_concurrency">多线程设计时的其它注意事项</h3>
 
-虽然我们已经讨论了很多并发设计需要注意的事项，但是作为一个好的并发代码。还需要考虑异常安全和可扩展性(scalability)。**如果一段代码的性能随着内核数量的增加而增加(一般呈线性趋势，即100个内核运行该代码的性能是一个内核运行该代码的性能的100倍)，那么称该代码是可扩展的(scalable)**。单线程代码一定不是可扩展的。
+虽然我们已经讨论了很多并发设计需要注意的事项，但是要想开发一个好的并发代码，还需要考虑异常安全和可扩展性(scalability)。**如果一段代码的性能随着内核数量的增加而增加(一般呈线性趋势，即100个内核运行该代码的性能是一个内核运行该代码的性能的100倍)，那么称该代码是可扩展的(scalable)**。单线程代码一定不是可扩展的。
 
 #### 并发算法中的异常安全
 
@@ -868,7 +868,7 @@ sum1 = 5026673, sum2 = 5026673
 
 #### 使用`std::async`处理异常
 
-在[基础篇](https://chorior.github.io/2017/04/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%9F%BA%E7%A1%80%E7%AF%87/#functional_program_with_future)中，我们知道**`std::async`确保线程数不会过载**，所以`std::async`很适合用来做并发递归：
+在[基础篇](https://chorior.github.io/2017/04/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%9F%BA%E7%A1%80%E7%AF%87/#functional_program_with_future)中，我们知道`std::async`确保线程数不会过载，所以`std::async`很适合用来做并发递归：
 
 ```c++
 #include <vector>
@@ -996,9 +996,9 @@ P = 1/(Fs + (1 - Fs)/N)
 
 所以**减少“串行”部分的大小，或者减少线程等待的时间，就能更好的改善程序的性能**。如果我们在线程等待的时候做一些有用的事情，就能将这个等待“隐藏”掉。
 
-阻塞的线程相当于什么都没做，但这浪费了CPU时间。**如果你知道一个线程可能花费相当长的时间等待，那么你可以通过运行一个或多个线程来利用和这个时间**。
+阻塞的线程相当于什么都没做，但这浪费了CPU时间。**如果你知道一个线程可能花费相当长的时间等待，那么你可以通过运行一个或多个线程来利用这个时间**。
 
-例如，如果一个线程正在等待一个I/O操作完成，那么你可以使用异步I/O来进行这个操作，这样线程就可以执行其它有用的工作，同时后台运行着I/O操作；如果一个线程正在等待另一个线程完成一个操作，那么你可以尝试自己完成那个操作；如果一个线程正在等待一个任务被完成，但是这个任务还没有被启动，那么你可以尝试在本线程完成这个任务或者做其它没有开始的任务，就像[这里](#data_based_work_division)的`do_sort`一样。
+例如，如果一个线程正在等待一个I/O操作完成，那么你可以使用异步I/O来进行这个操作，这样线程就可以执行其它有用的工作，同时后台运行着I/O操作；如果一个线程正在等待另一个线程完成一个操作，那么你可以尝试自己完成那个操作；如果一个线程正在等待一个任务被完成，但是这个任务还没有被启动，那么你可以尝试在本线程完成这个任务、或者做其它没有开始的任务，就像[上面](#data_based_work_division)的`do_sort`一样。
 
 **有时候添加线程并不是为了利用所有可用的处理器，而是为了对外部事件进行及时的响应**。
 
@@ -1016,7 +1016,7 @@ while (true)
 }
 ```
 
-为了确保及时响应用户输入，`get_event`和`process`必须以合理的频率被调用，不管程序在做什么。在[基于任务类型的工作划分](#task_type_based_work_division)第一节中，我们了解了单一线程及时处理用户输入是会大大增加代码的复杂性的，通过分离关注点，我们可以将处理用户输入与任务执行放在不同的线程中，下面的示例没有考虑线程数过载，且只具有参考价值：
+为了确保及时响应用户输入，`get_event`和`process`必须以合理的频率被调用，不管程序在做什么。在[基于任务类型的工作划分](#task_type_based_work_division)第一节中，我们了解了要使单线程及时处理用户输入是会大大增加代码的复杂性的，通过分离关注点，我们可以将处理用户输入与任务执行放在不同的线程中，下面的示例没有考虑线程数过载，且只具有参考价值：
 
 ```c++
 std::thread task_thread;
@@ -1074,7 +1074,7 @@ void process(event_data const& event)
 
 `std::for_each`对范围内每个元素调用同一个函数，其并行版与序列版唯一的区别就是元素调用函数的顺序。要实现一个`std::for_each`的并行版本，只需要基于数据的工作划分，即每个线程做一定数量的元素的工作。
 
-*	假设系统只有这一个多线程程序在运行，所以你可以使用`std::thread::hardware_concurrency()`来决定线程的数量；
+*	假设系统只有这一个多线程程序在运行，那么你可以使用`std::thread::hardware_concurrency()`来决定线程的数量；
 *	你知道元素的数量在工作开始前就能得到，所以你可以在工作开始前就将数据划分好；
 *	你也知道每个线程肯定是相互独立的，所以你可以使用连续的数据块来避免伪共享(false sharing)。
 
@@ -1859,7 +1859,7 @@ parallel_partial_sum tooks 13.122 ms
 
 如果你是一个程序员，那么你大部分时间会待在办公室里，但是有时候你必须外出解决一些问题，如果外出的地方很远，就会需要一辆车，公司是不可能为你专门配一辆车的，但是大多数公司都配备了一些公用的车辆。你外出的时候预订一辆，回来的时候归还一辆；如果某一天公用车辆用完了，那么你只能等待同事归还之后才能使用。
 
-线程池(thread pool)与上面的公用车辆类似：在大多数情况下，为每个任务都开一个线程是不切实际的(因为线程数太多以致过载后，任务切换会大大降低系统处理的速度)，线程池可以使得一定数量的任务并发执行，没有执行的任务将被挂在一个队列里面，一旦某个任务执行完毕，就从队列里面去一个任务继续执行。
+线程池(thread pool)与上面的公用车辆类似：在大多数情况下，为每个任务都开一个线程是不切实际的(因为线程数太多以致过载后，任务切换会大大降低系统处理的速度)，线程池可以使得一定数量的任务并发执行，没有执行的任务将被挂在一个队列里面，一旦某个任务执行完毕，就从队列里面取一个任务继续执行。
 
 线程池三个关键的问题是：
 
@@ -1871,7 +1871,7 @@ parallel_partial_sum tooks 13.122 ms
 
 一个最简单的线程池拥有固定数量的线程数，这个线程数一般是`std::thread::hardware_concurrency()`，当你有任务要做时，你只需要将其添加到等待队列里即可，线程池会自动的从这个队列里面不断的取任务并执行。
 
-下面展示了一个简单的线程池的实现，其中`threadsafe_queue`和`threadsafe_list`你可以在[C++ 多线程设计一](https://chorior.github.io/2017/05/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E8%AE%BE%E8%AE%A1-%E4%B8%80/)中找到：
+下面展示了一个简单的线程池的实现，其中`threadsafe_queue`和`threadsafe_list`你可以在[C++ 多线程设计（一）](https://chorior.github.io/2017/05/24/C++-%E5%A4%9A%E7%BA%BF%E7%A8%8B%E8%AE%BE%E8%AE%A1-%E4%B8%80/)中找到：
 
 ```c++
 #include <vector>
@@ -2041,7 +2041,7 @@ int main()
 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1
 ```
 
-从结果来看，178,176,177错位表示是并发执行的。使用`std::function`是为了使所有的[可调用对象](https://chorior.github.io/2017/04/04/C++-%E9%87%8A%E7%96%91-%E4%B8%89/#callable_object)都能进入线程池，**示例中应该在主函数里做try-catch处理**。注意成员声明的顺序，这样在销毁的时候，先等待所有线程结束，然后载销毁thread vector，最后再销毁`threadsafe_queue`，**你不能修改为其它的声明顺序**。
+从结果来看，178,176,177错位表示是并发执行的。使用`std::function`是为了使所有的[可调用对象](https://chorior.github.io/2017/04/04/C++-%E9%87%8A%E7%96%91-%E4%B8%89/#callable_object)都能进入线程池，**示例中应该在主函数里做try-catch处理**。注意成员声明的顺序，这样在销毁的时候，先等待所有线程结束，然后销毁thread vector，最后再销毁`threadsafe_queue`，**你不能修改为其它的声明顺序**。
 
 #### 等待任务提交到线程池
 
@@ -2278,129 +2278,7 @@ int main()
 #include <iostream>
 #include <iterator>
 
-#include "myQueue.h"
-
-class join_threads
-{
-	std::vector<std::thread>& threads;
-
-public:
-	explicit join_threads(std::vector<std::thread>& threads_) :
-		threads(threads_)
-	{}
-
-	~join_threads()
-	{
-		for (unsigned long i = 0; i<threads.size(); ++i)
-		{
-			if (threads[i].joinable())
-				threads[i].join();
-		}
-	}
-};
-
-class function_wrapper
-{
-	struct impl_base {
-		virtual void call() = 0;
-		virtual ~impl_base() {}
-	};
-
-	template<typename F>
-	struct impl_type : impl_base
-	{
-		F f;
-		impl_type(F&& f_) : f(std::move(f_)) {}
-		void call() { f(); }
-	};
-
-	std::unique_ptr<impl_base> impl;
-
-public:
-	function_wrapper() = default;
-
-	template<typename F>
-	function_wrapper(F&& f) :
-		impl(new impl_type<F>(std::move(f)))
-	{}
-
-	function_wrapper(const function_wrapper&) = delete;
-	function_wrapper& operator=(const function_wrapper&) = delete;
-
-	function_wrapper(function_wrapper&& other) :
-		impl(std::move(other.impl))
-	{}
-
-	function_wrapper& operator=(function_wrapper&& other)
-	{
-		impl = std::move(other.impl);
-		return *this;
-	}
-
-	void operator()() { impl->call(); }
-};
-
-class thread_pool
-{
-	std::atomic_bool done;
-	threadsafe_queue<function_wrapper> work_queue;
-	std::vector<std::thread> threads;
-	join_threads joiner;
-
-	void worker_thread()
-	{
-		while (!done)
-		{
-			function_wrapper task;
-			if (work_queue.try_pop(task))
-			{
-				task();
-			}
-			else
-			{
-				std::this_thread::yield();
-			}
-		}
-	}
-
-public:
-	thread_pool() :
-		done(false), joiner(threads)
-	{
-		unsigned const thread_count = std::thread::hardware_concurrency();
-		try
-		{
-			for (unsigned i = 0; i<thread_count; ++i)
-			{
-				threads.push_back(
-					std::thread(&thread_pool::worker_thread, this));
-			}
-		}
-		catch (...)
-		{
-			done = true;
-			throw;
-		}
-	}
-
-	~thread_pool()
-	{
-		done = true;
-	}
-
-	// std::result_of: 在编译的时候推导出一个函数调用表达式的返回值类型
-	template<typename FunctionType>
-	std::future<typename std::result_of<FunctionType()>::type>
-		submit(FunctionType f)
-	{
-		typedef typename std::result_of<FunctionType()>::type
-			result_type;
-		std::packaged_task<result_type()> task(std::move(f));
-		std::future<result_type> res(task.get_future());
-		work_queue.push(std::move(task));
-		return res;
-	}
-};
+#include "thread_pool.h"
 
 template<typename Iterator, typename T>
 struct accumulate_block
@@ -2504,10 +2382,9 @@ int main()
 accumulate_block tooks 0.263322 ms
 parallel_accumulate tooks 8.72107 ms
 sum1 = 5026673, sum2 = 5026673
-
 ```
 
-由于`thread_pool`只支持提交无参数可调用对象，所以修改了一下`accumulate_block`，无参数的函数调用运算符重载如果使用默认的构造对象进行调用的话，可能会发生异常，但是在主函数中进行了catch，google了一下，发现还是有跟我一样的sb的，这种参数问题早应该想到用`std::bind`来解决的：
+由于`thread_pool`只支持提交无参数可调用对象，所以修改了一下`accumulate_block`，无参数的函数调用运算符重载如果使用默认的构造对象进行调用的话，可能会发生异常，但是在主函数中进行了catch。google了一下，发现这种参数问题应该使用`std::bind`来解决：
 
 ```c++
 // use std::bind
@@ -2804,91 +2681,15 @@ int main()
 ```text
 sequential_quick_sort tooks 72.3024 ms
 parallel_quick_sort tooks 61.8166 ms
-
 ```
 
 这比[基于数据的工作划分](#data_based_work_division)中的代码简单多了，但是**由于`submit`或`run_pending_task`的每次调用都会去修改同一个`work_queue`，这就会造成强烈的数据竞争，虽然这个queue是线程安全的，但是还是会对性能造成很大的影响**。
 
 #### 避免`work_queue`的竞争
 
-要想避免`work_queue`的竞争，可以为每个线程设立一个独立的queue，这就需要`thread_local`声明了，该修饰符修饰的变量具有线程生命周期，完整示例如下：
+要想避免`work_queue`的竞争，可以为每个线程设立一个独立的queue，这就需要`thread_local`声明了，该修饰符修饰的变量具有线程生命周期：
 
 ```c++
-#include <vector>
-#include <algorithm>
-#include <numeric>
-#include <thread>
-#include <future>
-#include <random>
-#include <cstdlib>
-#include <iostream>
-#include <iterator>
-#include <list>
-#include <memory>
-#include <queue>
-
-#include "myQueue.h"
-
-class join_threads
-{
-	std::vector<std::thread>& threads;
-
-public:
-	explicit join_threads(std::vector<std::thread>& threads_) :
-		threads(threads_)
-	{}
-
-	~join_threads()
-	{
-		for (unsigned long i = 0; i<threads.size(); ++i)
-		{
-			if (threads[i].joinable())
-				threads[i].join();
-		}
-	}
-};
-
-class function_wrapper
-{
-	struct impl_base {
-		virtual void call() = 0;
-		virtual ~impl_base() {}
-	};
-
-	template<typename F>
-	struct impl_type : impl_base
-	{
-		F f;
-		impl_type(F&& f_) : f(std::move(f_)) {}
-		void call() { f(); }
-	};
-
-	std::unique_ptr<impl_base> impl;
-
-public:
-	function_wrapper() = default;
-
-	template<typename F>
-	function_wrapper(F&& f) :
-		impl(new impl_type<F>(std::move(f)))
-	{}
-
-	function_wrapper(const function_wrapper&) = delete;
-	function_wrapper& operator=(const function_wrapper&) = delete;
-
-	function_wrapper(function_wrapper&& other) :
-		impl(std::move(other.impl))
-	{}
-
-	function_wrapper& operator=(function_wrapper&& other)
-	{
-		impl = std::move(other.impl);
-		return *this;
-	}
-
-	void operator()() { impl->call(); }
-};
-
 class thread_pool
 {
 	std::atomic_bool done;
@@ -2973,227 +2774,15 @@ public:
 };
 
 thread_local std::unique_ptr<thread_pool::local_queue_type> thread_pool::local_work_queue = nullptr;
-
-template<typename T>
-struct sorter
-{
-	thread_pool pool;
-	std::list<T> do_sort(std::list<T>& chunk_data)
-	{
-		if (chunk_data.empty())
-		{
-			return chunk_data;
-		}
-
-		std::list<T> result;
-		result.splice(result.begin(), chunk_data, chunk_data.begin());
-		T const& partition_val = *result.begin();
-
-		typename std::list<T>::iterator divide_point =
-			std::partition(chunk_data.begin(), chunk_data.end(),
-				[&](T const& val) {return val<partition_val; });
-
-		std::list<T> new_lower_chunk;
-		new_lower_chunk.splice(new_lower_chunk.end(),
-			chunk_data, chunk_data.begin(),
-			divide_point);
-		std::future<std::list<T> > new_lower =
-			pool.submit(std::bind(&sorter::do_sort, this,
-				std::move(new_lower_chunk)));
-
-		std::list<T> new_higher(do_sort(chunk_data));
-		result.splice(result.end(), new_higher);
-		while (new_lower.wait_for(std::chrono::seconds(0)) !=
-			std::future_status::ready)
-		{
-			pool.run_pending_task();
-		}
-
-		result.splice(result.begin(), new_lower.get());
-		return result;
-	}
-};
-
-template<typename T>
-std::list<T> parallel_quick_sort(std::list<T> input)
-{
-	if (input.empty())
-	{
-		return input;
-	}
-	sorter<T> s;
-	return s.do_sort(input);
-}
-
-template<typename T>
-std::list<T> sequential_quick_sort(std::list<T> input)
-{
-	if (input.empty())
-	{
-		return input;
-	}
-	std::list<T> result;
-	// l.splice(iterator pos,list& x, iterator i)
-	// 将x中i指向的元素移动插入到l中pos指向的位置之前
-	result.splice(result.begin(), input, input.begin());
-	T const& pivot = *result.begin();
-
-	// std::partition(iterator beg, iterator end, func)
-	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
-	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
-	auto divide_point = std::partition(input.begin(), input.end(),
-		[&](T const& t) {return t<pivot; });
-
-	std::list<T> lower_part;
-	// l.splice(iterator pos,list& x, iterator beg, iterator end)
-	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
-	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
-
-	auto new_lower(
-		sequential_quick_sort(std::move(lower_part)));
-	auto new_higher(
-		sequential_quick_sort(std::move(input)));
-
-	// l.splice(iterator pos,list& x)
-	// 将x中所有元素移动插入到l中pos指向的位置之前
-	result.splice(result.end(), new_higher);
-	result.splice(result.begin(), new_lower);
-	return result;
-}
-
-int main()
-{
-	// 随机数生成
-	std::list<int> nums;
-	std::uniform_int_distribution<unsigned> u(0, 1000);
-	std::default_random_engine e;
-	for (int i = 0; i < 100; ++i) {
-		nums.push_back(u(e));
-	}
-
-	std::list<int> result1, result2;
-
-	auto time_start = std::chrono::high_resolution_clock::now();
-	result1 = sequential_quick_sort<int>(nums);
-	auto time_end = std::chrono::high_resolution_clock::now();
-	std::cout << "sequential_quick_sort tooks "
-		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
-		<< " ms\n";
-
-	time_start = std::chrono::high_resolution_clock::now();
-	try {
-		result2 = parallel_quick_sort<int>(nums);
-	}
-	catch (std::exception &e) {
-		std::cout << e.what();
-	}
-	time_end = std::chrono::high_resolution_clock::now();
-	std::cout << "parallel_quick_sort tooks "
-		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
-		<< " ms\n";
-
-	/*for (auto &i : result1)
-	{
-		std::cout << i << " ";
-	}
-	std::cout << "\n";
-	for (auto &i : result2)
-	{
-		std::cout << i << " ";
-	}*/
-}
 ```
 
-结果：
-
-```text
-sequential_quick_sort tooks 9.58035 ms
-parallel_quick_sort tooks 13.7223 ms
-
-```
-
-该实现确实避免了对`work_queue`的竞争，但是如果分贝不均的话，一些线程可能有大量的任务，而另一些线程却无所事事。解决这个问题的方法就是：**当本线程和全局queue没有任务可做时，允许获取其它线程的任务**。
+该实现确实避免了对`work_queue`的竞争，但是如果分配不均的话，一些线程可能有大量的任务，而另一些线程却无所事事。解决这个问题的方法就是：**当本线程和全局queue没有任务可做时，允许获取其它线程的任务**。
 
 #### 线程间获取任务
 
 要想使得线程间可以相互获取任务，那么线程所持有的queue一定要能在`run_pending_task`被访问，同时你也必须保证这个queue被正确的同步与保护着。为此，我们可以直接使用已创建的`threadsafe_queue`，然后将所有线程的queue保存在一个全局容器里，`run_pending_task`在获取任务时，先检查本地queue，再检查全局queue，最后逐个检查其他线程的queue。这里在检查其它线程queue时，一个比较重要点是：不要从线程0到最后一个线程逐个检查，这样每个空闲的线程都会尝试从线程0的queue获取任务，可能会造成对线程0的queue的竞争访问。解决方案是：从空闲线程的下一个线程的queue开始获取，直到对所有线程的queue都做一个遍历。**因为要做遍历，所以在检查其它线程的queue之前，先要判断是否所有线程都开起来了**。
 
 ```c++
-#include <vector>
-#include <algorithm>
-#include <numeric>
-#include <thread>
-#include <future>
-#include <random>
-#include <cstdlib>
-#include <iostream>
-#include <iterator>
-#include <list>
-#include <memory>
-#include <queue>
-
-#include "myQueue.h"
-
-class join_threads
-{
-	std::vector<std::thread>& threads;
-
-public:
-	explicit join_threads(std::vector<std::thread>& threads_) :
-		threads(threads_)
-	{}
-
-	~join_threads()
-	{
-		for (unsigned long i = 0; i<threads.size(); ++i)
-		{
-			if (threads[i].joinable())
-				threads[i].join();
-		}
-	}
-};
-
-class function_wrapper
-{
-	struct impl_base {
-		virtual void call() = 0;
-		virtual ~impl_base() {}
-	};
-
-	template<typename F>
-	struct impl_type : impl_base
-	{
-		F f;
-		impl_type(F&& f_) : f(std::move(f_)) {}
-		void call() { f(); }
-	};
-
-	std::unique_ptr<impl_base> impl;
-
-public:
-	function_wrapper() = default;
-
-	template<typename F>
-	function_wrapper(F&& f) :
-		impl(new impl_type<F>(std::move(f)))
-	{}
-
-	function_wrapper(const function_wrapper&) = delete;
-	function_wrapper& operator=(const function_wrapper&) = delete;
-
-	function_wrapper(function_wrapper&& other) :
-		impl(std::move(other.impl))
-	{}
-
-	function_wrapper& operator=(function_wrapper&& other)
-	{
-		impl = std::move(other.impl);
-		return *this;
-	}
-
-	void operator()() { impl->call(); }
-};
-
 class thread_pool
 {
 	typedef function_wrapper task_type;
@@ -3304,143 +2893,6 @@ public:
 
 thread_local threadsafe_queue<function_wrapper>* thread_pool::local_work_queue = nullptr;
 thread_local unsigned thread_pool::my_index = 0;
-
-template<typename T>
-struct sorter
-{
-	thread_pool pool;
-	std::list<T> do_sort(std::list<T>& chunk_data)
-	{
-		if (chunk_data.empty())
-		{
-			return chunk_data;
-		}
-
-		std::list<T> result;
-		result.splice(result.begin(), chunk_data, chunk_data.begin());
-		T const& partition_val = *result.begin();
-
-		typename std::list<T>::iterator divide_point =
-			std::partition(chunk_data.begin(), chunk_data.end(),
-				[&](T const& val) {return val<partition_val; });
-
-		std::list<T> new_lower_chunk;
-		new_lower_chunk.splice(new_lower_chunk.end(),
-			chunk_data, chunk_data.begin(),
-			divide_point);
-		std::future<std::list<T> > new_lower =
-			pool.submit(std::bind(&sorter::do_sort, this,
-				std::move(new_lower_chunk)));
-
-		std::list<T> new_higher(do_sort(chunk_data));
-		result.splice(result.end(), new_higher);
-		while (new_lower.wait_for(std::chrono::seconds(0)) !=
-			std::future_status::ready)
-		{
-			pool.run_pending_task();
-		}
-
-		result.splice(result.begin(), new_lower.get());
-		return result;
-	}
-};
-
-template<typename T>
-std::list<T> parallel_quick_sort(std::list<T> input)
-{
-	if (input.empty())
-	{
-		return input;
-	}
-	sorter<T> s;
-	return s.do_sort(input);
-}
-
-template<typename T>
-std::list<T> sequential_quick_sort(std::list<T> input)
-{
-	if (input.empty())
-	{
-		return input;
-	}
-	std::list<T> result;
-	// l.splice(iterator pos,list& x, iterator i)
-	// 将x中i指向的元素移动插入到l中pos指向的位置之前
-	result.splice(result.begin(), input, input.begin());
-	T const& pivot = *result.begin();
-
-	// std::partition(iterator beg, iterator end, func)
-	// 将[beg,end)中的元素按func分为两组，第一组使func返回true，第二组使func返回false
-	// 返回分组后指向第二组的第一个元素的迭代器，不保证原有元素的顺序
-	auto divide_point = std::partition(input.begin(), input.end(),
-		[&](T const& t) {return t<pivot; });
-
-	std::list<T> lower_part;
-	// l.splice(iterator pos,list& x, iterator beg, iterator end)
-	// 将x中[beg,end)范围内元素移动插入到l中pos指向的位置之前
-	lower_part.splice(lower_part.end(), input, input.begin(), divide_point);
-
-	auto new_lower(
-		sequential_quick_sort(std::move(lower_part)));
-	auto new_higher(
-		sequential_quick_sort(std::move(input)));
-
-	// l.splice(iterator pos,list& x)
-	// 将x中所有元素移动插入到l中pos指向的位置之前
-	result.splice(result.end(), new_higher);
-	result.splice(result.begin(), new_lower);
-	return result;
-}
-
-int main()
-{
-	// 随机数生成
-	std::list<int> nums;
-	std::uniform_int_distribution<unsigned> u(0, 1000);
-	std::default_random_engine e;
-	for (int i = 0; i < 1000; ++i) {
-		nums.push_back(u(e));
-	}
-
-	std::list<int> result1, result2;
-
-	auto time_start = std::chrono::high_resolution_clock::now();
-	result1 = sequential_quick_sort<int>(nums);
-	auto time_end = std::chrono::high_resolution_clock::now();
-	std::cout << "sequential_quick_sort tooks "
-		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
-		<< " ms\n";
-
-	time_start = std::chrono::high_resolution_clock::now();
-	try {
-		result2 = parallel_quick_sort<int>(nums);
-	}
-	catch (std::exception &e) {
-		std::cout << e.what();
-	}
-	time_end = std::chrono::high_resolution_clock::now();
-	std::cout << "parallel_quick_sort tooks "
-		<< std::chrono::duration<double, std::milli>(time_end - time_start).count()
-		<< " ms\n";
-
-	/*for (auto &i : result1)
-	{
-		std::cout << i << " ";
-	}
-	std::cout << "\n";
-	for (auto &i : result2)
-	{
-		std::cout << i << " ";
-	}*/
-}
-```
-
-结果：
-
-```text
-sequential_quick_sort tooks 74.7177 ms
-parallel_quick_sort tooks 62.3508 ms
-
 ```
 
 虽然在`pop_task_from_other_thread_queue`的guard是`queues.size()`，但是如果不在`run_pending_task`中判断`queues.size() == thread_count`的话，就会发生异常。**这个线程池对于很多场景都能很好的工作**，一个不好的地方就是：**不能动态改变线程的数量**。
@@ -3744,7 +3196,6 @@ int main()
 ```text
 ew
 thread interrupted.
-
 ```
 
 答案是能够正常运行，为了将异常传递到主线程，我传递了一个promise变量，当中断发生的时候就设置一个异常在里面，在主线程调用get时就会重新抛出；`getchar()`用来控制中断发生的时间；如果foo由于其它异常导致退出以至于f没有调用`set_exception`，那么主线程将会一直在get处等待，当然这永远不会发生，因为foo不可能发生其他异常。
@@ -3825,7 +3276,6 @@ int main()
 ```text
 asd
 thread interrupted.
-
 ```
 
 #### 中断其它阻塞调用
@@ -3896,7 +3346,6 @@ int main()
 ```text
 d
 thread interrupted.
-
 ```
 
 <h2 id="testing_and_debugging_multithreaded_applications">多线程程序的测试与调试</h2>
@@ -3913,7 +3362,7 @@ thread interrupted.
 什么时候的阻塞是不必要的呢？
 
 *	死锁(deadlock)：两个线程相互等待，使得都不能正常工作，这样的阻塞是不必要的；
-*	活锁(livelock)：两个线程过独木桥，必须一个先过才能解决问题，不然就会一直不停循环，还会占用CPU，这样的阻塞也是不必要的；
+*	活锁(livelock)：活锁出现在无锁数据结构中，两个线程过独木桥，必须一个先过才能解决问题，不然就会一直不停循环，还会占用CPU，这样的阻塞也是不必要的；
 *	I/O或其它外部输入：如果线程A在等待输入，那么它就不能做事，这时如果另一个线程B在等待线程A执行某些操作，那么B的阻塞就是不必要的；
 
 #### 条件竞争
@@ -3922,7 +3371,7 @@ thread interrupted.
 
 条件竞争通常会产生以下几种类型的错误：
 
-*	数据竞争(data races)：如果并发的去修改一个独立对象，那么很可能某个线程在读取该独立对象的时候会读到错误的数据；
+*	数据竞争(data races)：如果并发的去修改一个独立对象，那么很可能某个线程在读取该对象时会读到错误的数据；
 *	破坏的不变量(broken invariants)：所谓不变量就是指状态很稳定，这个词不太好描述，之前的文章很少使用它，通俗一点就是--当前数据结构没有处于正在被修改状态。如果一个数据结构正在被一个线程修改，并且另一个线程能够看到该数据结构在修改过程中的中间状态，那么就称这个数据结构的不变量被破坏了。很明显，破坏的不变量可能导致读取到不正确的数据；
 *	生命周期问题(lifetime issues)：如果一个数据被删除或移动了，另一个线程还在对其进行访问，就会发生未定义行为。这通常发生在对局部变量的引用或其指针的传递使用上。
 
@@ -3947,7 +3396,7 @@ review并发代码时需要思考的问题：
 *	当前线程加载的数据是否仍然有效？它是否被其它线程修改了？
 *	假设其它线程能够修改这个数据，你是如何确保其不变量不被破坏的？
 
-**为了确保持有一个mutex时对一个数据的访问是安全的，你必须确保持有另一个mutex的线程不能对这个数据进行访问**，很明显这可能会破坏不变量。
+**为了确保持有某个mutex时对一个数据的访问是安全的，你必须确保持持有另一个mutex的线程不能对这个数据进行访问**，很明显这可能会破坏不变量。
 
 **对公共数据的指针或引用需要特别小心**。
 
@@ -3994,7 +3443,7 @@ review并发代码时需要思考的问题：
 
 例如，当你测试一个状态机时，你可以将其分为几个部分：每个线程的状态逻辑可以使用单线程技术进行测试；线程间消息的传递可以使用多线程但是简单的状态逻辑进行测试，目标只是确认消息以正确的顺序传递到正确的线程即可。
 
-如果你能将代码分为读共享数据、转换共享数据、更新共享数据三个板块，那么转换共享数据那块就能用单线程技术机型测试，这样并发测试也能减少到只测试共享数据的读和更新板块。总之，**如果能将多线程代码分离出能够使用单线程进行测试的部分，就能更容易的进行测试**。
+如果你能将代码分为读共享数据、转换共享数据、更新共享数据三个板块，那么转换共享数据那块就能用单线程技术进行测试，这样并发测试也能减少到只测试共享数据的读和更新板块。总之，**如果能将多线程代码分离出能够使用单线程进行测试的部分，就能更容易的进行测试**。
 
 需要注意的是：某些库会用其内部变量存储状态，如果多个线程使用相同的库，那么这些状态就会被共享，你应该在适当的时候添加一些保护和同步。
 
